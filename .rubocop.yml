@@ -1,0 +1,58 @@
+inherit_from: .rubocop_todo.yml
+
+inherit_gem:
+  rubocop-shopify: rubocop.yml
+
+require:
+  - rubocop-sorbet
+  - rubocop-rake
+  - rubocop-minitest
+
+AllCops:
+  TargetRubyVersion: 2.6
+  UseCache: true
+  CacheRootDirectory: tmp/rubocop
+  Exclude:
+    - minitest-distributed.gemspec
+  NewCops: disable
+
+# This cop is broken when using assignments
+Layout/RescueEnsureAlignment:
+  Enabled: false
+
+##### Sorbet cops
+
+Sorbet:
+  Enabled: true
+  Exclude:
+    - bin/*
+    - test/fixtures/*
+    - Gemfile
+    - Rakefile
+    - minitest-distributed.gemspec
+
+Sorbet/ValidSigil:
+  Enabled: true
+
+Sorbet/FalseSigil:
+  Enabled: false
+
+Sorbet/TrueSigil:
+  Enabled: true
+  Exclude:
+    - 'test/fixtures/*'
+
+Sorbet/EnforceSigilOrder:
+  Enabled: true
+
+Sorbet/SignatureBuildOrder:
+  Enabled: true
+
+Sorbet/KeywordArgumentOrdering:
+  Enabled: true
+
+Sorbet/ConstantsFromStrings:
+  Enabled: true
+
+Sorbet/ForbidIncludeConstLiteral:
+  Enabled: true

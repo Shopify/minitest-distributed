@@ -1,0 +1,44 @@
+{
+  "tests": {
+    "Minitest::StatefulTest#test_that_it_has_a_version_number": {
+      "success_expected": {
+        "runs": 100,
+        "passes": 95,
+        "errors": 2,
+        "failures": 3,
+        "skips": 0,
+        "duration_total": 0.0,
+        "duration_avg": 0.0
+      },
+      "success_not_expected": {
+        "runs": 101,
+        "passes": 73,
+        "errors": 5,
+        "failures": 23,
+        "skips": 0,
+        "duration_total": 1.5000347048044205e-05,
+        "duration_avg": 1.4851828760439807e-07
+      }
+    },
+    "Minitest::StatefulTest#test_it_does_something_useful": {
+      "success_expected": {
+        "runs": 0,
+        "passes": 0,
+        "errors": 0,
+        "failures": 0,
+        "skips": 0,
+        "duration_total": 0.0,
+        "duration_avg": 0.0
+      },
+      "success_not_expected": {
+        "runs": 2,
+        "passes": 0,
+        "errors": 0,
+        "failures": 2,
+        "skips": 0,
+        "duration_total": 5.3999945521354675e-05,
+        "duration_avg": 2.6999972760677338e-05
+      }
+    }
+  }
+}
