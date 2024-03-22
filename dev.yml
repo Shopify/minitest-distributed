@@ -3,5 +3,5 @@ name: minitest-distributed
 type: ruby
 
 up:
-  - ruby: 3.2.0
+  - ruby
   - bundler
