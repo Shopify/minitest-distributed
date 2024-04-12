@@ -1,7 +1,7 @@
 # typed: true
 # frozen_string_literal: true
 
-require_relative "./distributed"
+require_relative "distributed"
 
 module Minitest
   class << self
