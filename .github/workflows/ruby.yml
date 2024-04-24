@@ -18,7 +18,7 @@ jobs:
     container: ruby:${{ matrix.ruby_version }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Install dependencies
       run: gem install bundler -v 2.4.22 && bundle install
     - name: Run tests
