@@ -6,8 +6,8 @@ require "minitest/distributed"
 require "minitest/autorun"
 
 # Load test helpers
-require_relative "./lib/integration_test"
-require_relative "./lib/redis_integration_test"
+require_relative "lib/integration_test"
+require_relative "lib/redis_integration_test"
 
 require "toxiproxy"
 
