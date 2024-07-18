@@ -19,6 +19,10 @@ class MemoryCoordinatorIntegrationTest < IntegrationTest
 
       # Running:
 
+
+      Finished in 0.123s, 0.123 runs/s, 0.123 assertions/s.
+
+      0 runs, 0 assertions, 0 failures, 0 errors, 0 skips
     EOM
   end
 
