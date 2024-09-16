@@ -47,4 +47,5 @@ Gem::Specification.new do |spec|
   spec.add_dependency('minitest', '~> 5.12')
   spec.add_dependency('redis', '>= 5.0.6', '< 6')
   spec.add_dependency('sorbet-runtime')
+  spec.add_dependency('rexml')
 end
