@@ -34,7 +34,7 @@ class RedisIntegrationTest < IntegrationTest
     #   2) Not the DB in use by any of the other workers.
     #
     # TODO: ensure that every worker uses a different redis in a better way.
-    @redis_uri = "#{ENV.fetch("REDIS_URL", "redis://0.0.0.0:22220")}/#{Kernel.rand(1...16)}"
+    @redis_uri = "#{ENV.fetch("REDIS_URL", "redis://0.0.0.0:22220")}"
     @redis = Redis.new(url: @redis_uri)
     @redis.flushdb
 

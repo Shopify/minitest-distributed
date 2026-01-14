@@ -268,7 +268,28 @@ module Minitest
 
         sig { returns(Redis) }
         def redis
-          @redis ||= Redis.new(url: configuration.coordinator_uri.to_s)
+          @redis ||= Redis.new(
+            url: configuration.coordinator_uri.to_s,
+            middlewares: custom_middlewares,
+            custom: custom_config,
+          )
+        end
+
+        sig { returns(T.nilable(T::Array[Module])) }
+        def custom_middlewares
+          return unless ENV.key?("MINITEST_DISTRIBUTED_REDIS_LOG")
+
+          require_relative "redis_instrumentation_middleware"
+          [RedisInstrumentationMiddleware]
+        end
+
+        sig { returns(T.nilable(T::Hash[Symbol, File])) }
+        def custom_config
+          return unless (log_path = ENV["MINITEST_DISTRIBUTED_REDIS_LOG"])
+
+          log_file = File.open(log_path, "a")
+          log_file.sync = true
+          { log_file: log_file }
         end
 
         sig { returns(String) }
