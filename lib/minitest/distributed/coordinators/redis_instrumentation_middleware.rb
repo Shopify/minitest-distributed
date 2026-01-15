@@ -13,24 +13,24 @@ module Minitest
         sig { params(command: T::Array[T.untyped], redis_config: T.untyped).returns(T.untyped) }
         def call(command, redis_config)
           log_file = redis_config.custom[:log_file]
-          log_file.puts("EXEC: #{command.inspect}")
+          log_file.info("EXEC: #{command.inspect}")
           result = super
-          log_file.puts("RESULT: #{result.inspect}")
+          log_file.info("RESULT: #{result.inspect}")
           result
         rescue => e
-          log_file.puts("ERROR: #{e.class}")
+          log_file.info("ERROR: #{e.class}")
           raise
         end
 
         sig { params(commands: T::Array[T.untyped], redis_config: T.untyped).returns(T.untyped) }
         def call_pipelined(commands, redis_config)
           log_file = redis_config.custom[:log_file]
-          log_file.puts("EXEC PIPELINED: #{commands.inspect}")
+          log_file.info("EXEC PIPELINED: #{commands.inspect}")
           result = super
-          log_file.puts("RESULT PIPELINED: #{result.inspect}")
+          log_file.info("RESULT PIPELINED: #{result.inspect}")
           result
         rescue => e
-          log_file.puts("ERROR PIPELINED: #{e.class}")
+          log_file.info("ERROR PIPELINED: #{e.class}")
           raise
         end
       end

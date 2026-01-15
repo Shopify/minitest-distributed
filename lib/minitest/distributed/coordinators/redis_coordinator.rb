@@ -96,7 +96,7 @@ module Minitest
               key("size"),
             )
 
-            ResultAggregate.new(
+            result = ResultAggregate.new(
               max_failures: configuration.max_failures,
 
               runs: Integer(stats_as_string.fetch(0) || 0),
@@ -114,6 +114,10 @@ module Minitest
               # higher than the number of acks, so the run is not consider completed yet.
               size: Integer(stats_as_string.fetch(9) || 2_147_483_647),
             )
+
+            logger&.info("[CACHE_INIT] Worker #{configuration.worker_id}: acks=#{result.acks}, discards=#{result.discards}, size=#{result.size}")
+
+            result
           end
         end
 
@@ -229,12 +233,18 @@ module Minitest
             fresh_runnables = claim_fresh_runnables(block: exponential_backoff)
             process_batch(fresh_runnables, reporter)
 
+            # Debug logging: Check completion state
+            log_completion_state(stale_runnables, fresh_runnables, exponential_backoff)
+
             # If we have acked the same amount of tests as we were supposed to, the run
             # is complete and we can exit our loop. Generally, only one worker will detect
             # this condition. The pther workers will quit their consumer loop because the
             # consumergroup will be deleted by the first worker, and their Redis commands
             # will start to fail - see the rescue block below.
-            break if combined_results.complete?
+            result = combined_results
+            is_complete = result.complete?
+            log_completion_check(result, is_complete)
+            break if is_complete
 
             # We also abort a run if we reach the maximum number of failures
             break if combined_results.abort?
@@ -285,11 +295,7 @@ module Minitest
 
         sig { returns(T.nilable(T::Hash[Symbol, File])) }
         def custom_config
-          return unless (log_path = ENV["MINITEST_DISTRIBUTED_REDIS_LOG"])
-
-          log_file = File.open(log_path, "a")
-          log_file.sync = true
-          { log_file: log_file }
+          { log_file: logger }.compact
         end
 
         sig { returns(String) }
@@ -450,6 +456,9 @@ module Minitest
 
         sig { params(results: ResultAggregate).void }
         def adjust_combined_results(results)
+          old_acks = @combined_results&.acks || 0
+          old_discards = @combined_results&.discards || 0
+
           updated = redis.multi do |pipeline|
             pipeline.incrby(key("runs"), results.runs)
             pipeline.incrby(key("assertions"), results.assertions)
@@ -476,6 +485,13 @@ module Minitest
             acks: updated[8],
             size: updated[9],
           )
+
+          if results.acks != 0 || results.discards != 0
+            logger&.info("[CACHE_UPDATE] Worker #{configuration.worker_id}: " \
+              "acks #{old_acks}->#{updated[8]} (+#{results.acks}), " \
+              "discards #{old_discards}->#{updated[7]} (+#{results.discards}), " \
+              "size=#{updated[9]}")
+          end
         end
 
         sig { params(name: String).returns(String) }
@@ -536,6 +552,74 @@ module Minitest
           end
 
           adjust_combined_results(batch_result_aggregate)
+        end
+
+        sig { params(stale: T::Array[EnqueuedRunnable], fresh: T::Array[EnqueuedRunnable], backoff: Integer).void }
+        def log_completion_state(stale, fresh, backoff)
+          # Only log when we're in a waiting state (no work found) to avoid spam
+          return unless stale.empty? && fresh.empty?
+
+          # Only log periodically when backoff is increasing (to reduce log volume)
+          return unless backoff >= 1280 # Log at 1.28s, 2.56s, 5.12s, etc.
+
+          # Only log if Redis logging is enabled
+          return unless logger
+
+          # Fetch current Redis state to compare with cached state
+          redis_stats = redis.mget(
+            key("runs"),
+            key("assertions"),
+            key("passes"),
+            key("failures"),
+            key("errors"),
+            key("skips"),
+            key("requeues"),
+            key("discards"),
+            key("acks"),
+            key("size"),
+          )
+
+          # Get pending count from Redis
+          pending_items = redis.xpending(stream_key, group_name, "-", "+", 10)
+
+          cached = combined_results
+          redis_acks = Integer(redis_stats[8] || 0)
+          redis_discards = Integer(redis_stats[7] || 0)
+          redis_size = Integer(redis_stats[9] || 0)
+
+          logger.info("[WAITING] Worker #{configuration.worker_id}: backoff=#{backoff}ms")
+          logger.info("  [WAITING] Cached: acks=#{cached.acks}, discards=#{cached.discards}, size=#{cached.size}, complete?=#{cached.complete?}")
+          logger.info("  [WAITING] Redis:  acks=#{redis_acks}, discards=#{redis_discards}, size=#{redis_size}")
+          logger.info("  [WAITING] Pending: #{pending_items.length} items")
+          if pending_items.any?
+            logger.info("  [WAITING] First pending: #{pending_items.first[0]} (owner=#{pending_items.first[1]}, idle=#{pending_items.first[2]}ms)")
+          end
+          logger.info("  [WAITING] Cache staleness: acks_diff=#{redis_acks - cached.acks}, discards_diff=#{redis_discards - cached.discards}")
+        end
+
+        sig { returns(T.nilable(Logger)) }
+        def logger
+          return unless (log_path = ENV["MINITEST_DISTRIBUTED_REDIS_LOG"])
+
+          require "logger"
+          @logger ||= Logger.new(log_path)
+        end
+
+        sig { params(result: ResultAggregate, is_complete: T::Boolean).void }
+        def log_completion_check(result, is_complete)
+          return unless logger
+
+          if is_complete
+            logger.info("[COMPLETE] Worker #{configuration.worker_id} detected completion: acks=#{result.acks}, size=#{result.size}")
+          elsif result.acks + result.discards >= result.size
+            logger.warn("[BUG] Worker #{configuration.worker_id} completion check FAILED but acks+discards>=size: " \
+              "acks=#{result.acks}, discards=#{result.discards}, size=#{result.size}, " \
+              "acks+discards=#{result.acks + result.discards}")
+          elsif result.size - result.acks <= 20
+            # Log when we're close to completion
+            logger.info("[PROGRESS] Worker #{configuration.worker_id}: acks=#{result.acks}, discards=#{result.discards}, " \
+              "size=#{result.size}, remaining=#{result.size - result.acks}")
+          end
         end
 
         INITIAL_BACKOFF = 10 # milliseconds
