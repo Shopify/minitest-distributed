@@ -3,7 +3,7 @@
 
 require "redis"
 require "set"
-
+require "logger"
 module Minitest
   module Distributed
     module Coordinators
@@ -601,7 +601,6 @@ module Minitest
         def logger
           return unless (log_path = ENV["MINITEST_DISTRIBUTED_REDIS_LOG"])
 
-          require "logger"
           @logger ||= Logger.new(log_path)
         end
 
