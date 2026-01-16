@@ -314,6 +314,68 @@ module Minitest
           LUA
         end
 
+        sig { returns(String) }
+        def xack_and_increment_script
+          @xack_and_increment_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
+            -- Atomically xack messages and increment stats counters.
+            -- This makes the operation idempotent: if a client times out and retries,
+            -- the retry will see xack return 0 (already acked) and won't double-count.
+            --
+            -- KEYS[1] = stream key
+            -- KEYS[2] = stats key prefix
+            -- ARGV[1] = group name
+            -- ARGV[2] = number of messages
+            -- ARGV[3..3+count-1] = message IDs
+            -- ARGV[3+count..3+count*2-1] = runs deltas
+            -- ARGV[3+count*2..3+count*3-1] = assertions deltas
+            -- ARGV[3+count*3..3+count*4-1] = passes deltas
+            -- ARGV[3+count*4..3+count*5-1] = failures deltas
+            -- ARGV[3+count*5..3+count*6-1] = errors deltas
+            -- ARGV[3+count*6..3+count*7-1] = skips deltas
+            -- ARGV[3+count*7..3+count*8-1] = requeues deltas
+            -- ARGV[3+count*8..3+count*9-1] = discards deltas
+
+            local stream = KEYS[1]
+            local stats_prefix = KEYS[2]
+            local group = ARGV[1]
+            local count = tonumber(ARGV[2])
+
+            local ack_results = {}
+
+            for i = 0, count - 1 do
+              local msg_id = ARGV[3 + i]
+              local runs = tonumber(ARGV[3 + count + i])
+              local assertions = tonumber(ARGV[3 + count*2 + i])
+              local passes = tonumber(ARGV[3 + count*3 + i])
+              local failures = tonumber(ARGV[3 + count*4 + i])
+              local errors = tonumber(ARGV[3 + count*5 + i])
+              local skips = tonumber(ARGV[3 + count*6 + i])
+              local requeues = tonumber(ARGV[3 + count*7 + i])
+              local discards = tonumber(ARGV[3 + count*8 + i])
+
+              -- Attempt to ack the message
+              local ack_result = redis.call('XACK', stream, group, msg_id)
+              table.insert(ack_results, ack_result)
+
+              -- Only increment counters if xack succeeded (returned 1)
+              -- If xack returned 0, message was already acked - don't double-count!
+              if ack_result == 1 then
+                redis.call('INCRBY', stats_prefix .. '/runs', runs)
+                redis.call('INCRBY', stats_prefix .. '/assertions', assertions)
+                redis.call('INCRBY', stats_prefix .. '/passes', passes)
+                redis.call('INCRBY', stats_prefix .. '/failures', failures)
+                redis.call('INCRBY', stats_prefix .. '/errors', errors)
+                redis.call('INCRBY', stats_prefix .. '/skips', skips)
+                redis.call('INCRBY', stats_prefix .. '/requeues', requeues)
+                redis.call('INCRBY', stats_prefix .. '/discards', discards)
+                redis.call('INCRBY', stats_prefix .. '/acks', 1)
+              end
+            end
+
+            return ack_results
+          LUA
+        end
+
         sig { params(block: Integer).returns(T::Array[EnqueuedRunnable]) }
         def claim_fresh_runnables(block:)
           result = redis.xreadgroup(
@@ -516,29 +578,110 @@ module Minitest
             [enqueued_runnable, enqueued_runnable.run]
           end
 
-          # Try to commit all the results of this batch to Redis
-          runnable_results = []
+          # First, handle requeues separately (they use sadd, not xack)
+          requeue_commits = {}
           redis.multi do |pipeline|
             results.each do |enqueued_runnable, initial_result|
-              runnable_results << enqueued_runnable.commit_result(initial_result) do |result_to_commit|
-                if ResultType.of(result_to_commit) == ResultType::Requeued
-                  sadd_future = pipeline.sadd(key("retry_set"), [enqueued_runnable.attempt_id])
-                  EnqueuedRunnable::Result::Commit.new { sadd_future.value > 0 }
-                else
-                  xack_future = pipeline.xack(stream_key, group_name, enqueued_runnable.entry_id)
-                  EnqueuedRunnable::Result::Commit.new { xack_future.value == 1 }
-                end
+              if ResultType.of(initial_result) == ResultType::Requeued
+                sadd_future = pipeline.sadd(key("retry_set"), [enqueued_runnable.attempt_id])
+                requeue_commits[enqueued_runnable.entry_id] = [enqueued_runnable, initial_result, sadd_future]
               end
             end
           end
 
-          batch_result_aggregate = ResultAggregate.new
+          # Prepare data for atomic xack + increment via Lua script
+          message_ids = []
+          runs_deltas = []
+          assertions_deltas = []
+          passes_deltas = []
+          failures_deltas = []
+          errors_deltas = []
+          skips_deltas = []
+          requeues_deltas = []
+          discards_deltas = []
+
+          xack_runnables = []
+
+          results.each do |enqueued_runnable, initial_result|
+            # Skip requeues - they were already handled
+            next if ResultType.of(initial_result) == ResultType::Requeued
+
+            message_ids << enqueued_runnable.entry_id
+            xack_runnables << [enqueued_runnable, initial_result]
+
+            # Calculate deltas for this result
+            is_discard = initial_result.is_a?(Minitest::Discard)
+            runs_deltas << (is_discard ? initial_result.runs : (initial_result.passed? || initial_result.skipped? || initial_result.error? || initial_result.failure? ? 1 : 0))
+            assertions_deltas << initial_result.assertions
+            passes_deltas << (initial_result.passed? ? 1 : 0)
+            failures_deltas << (initial_result.failure? ? 1 : 0)
+            errors_deltas << (initial_result.error? ? 1 : 0)
+            skips_deltas << (initial_result.skipped? ? 1 : 0)
+            requeues_deltas << 0
+            discards_deltas << (is_discard ? 1 : 0)
+          end
+
+          # Call Lua script to atomically xack + increment counters
+          # This is idempotent: retry after timeout will see xack return 0 and skip counting
+          ack_results = if message_ids.any?
+            redis.evalsha(
+              xack_and_increment_script,
+              keys: [stream_key, "minitest/#{configuration.run_id}"],
+              argv: [
+                group_name,
+                message_ids.size,
+                *message_ids,
+                *runs_deltas,
+                *assertions_deltas,
+                *passes_deltas,
+                *failures_deltas,
+                *errors_deltas,
+                *skips_deltas,
+                *requeues_deltas,
+                *discards_deltas,
+              ],
+            )
+          else
+            []
+          end
+
+          # Build runnable results with commit status
+          runnable_results = []
+
+          # Add requeue results
+          requeue_commits.each do |_entry_id, (enqueued_runnable, result, sadd_future)|
+            commit = EnqueuedRunnable::Result::Commit.new { sadd_future.value > 0 }
+            runnable_results << EnqueuedRunnable::Result.new(
+              enqueued_runnable: enqueued_runnable,
+              initial_result: result,
+              commit: commit,
+            )
+          end
+
+          # Add xack results
+          # Note: xack returning 0 means "already acked" (idempotent retry), which is SUCCESS
+          # We only treat it as failure if there's an actual error
+          xack_runnables.each_with_index do |(enqueued_runnable, result), idx|
+            ack_result = ack_results[idx]
+            # Both 0 and 1 are success: 1 = newly acked, 0 = already acked (retry)
+            commit = EnqueuedRunnable::Result::Commit.new { ack_result == 0 || ack_result == 1 }
+            runnable_results << EnqueuedRunnable::Result.new(
+              enqueued_runnable: enqueued_runnable,
+              initial_result: result,
+              commit: commit,
+            )
+          end
+
+          # Refresh our local cache from Redis
+          @combined_results = nil
+          combined_results # Force refresh
+
+          # Report results and update local stats
           runnable_results.each do |runnable_result|
             # Complete the reporter contract by calling `record` with the result.
             reporter.record(runnable_result.committed_result)
 
-            # Update statistics.
-            batch_result_aggregate.update_with_result(runnable_result)
+            # Update local statistics
             local_results.update_with_result(runnable_result)
 
             case (result_type = ResultType.of(runnable_result.committed_result))
@@ -550,8 +693,6 @@ module Minitest
               T.absurd(result_type)
             end
           end
-
-          adjust_combined_results(batch_result_aggregate)
         end
 
         sig { params(stale: T::Array[EnqueuedRunnable], fresh: T::Array[EnqueuedRunnable], backoff: Integer).void }
