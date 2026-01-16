@@ -609,16 +609,17 @@ module Minitest
             message_ids << enqueued_runnable.entry_id
             xack_runnables << [enqueued_runnable, initial_result]
 
-            # Calculate deltas for this result
-            is_discard = initial_result.is_a?(Minitest::Discard)
-            runs_deltas << (is_discard ? initial_result.runs : (initial_result.passed? || initial_result.skipped? || initial_result.error? || initial_result.failure? ? 1 : 0))
+            # Calculate deltas for this result based on ResultType
+            result_type = ResultType.of(initial_result)
+
+            runs_deltas << 1
             assertions_deltas << initial_result.assertions
-            passes_deltas << (initial_result.passed? ? 1 : 0)
-            failures_deltas << (initial_result.failure? ? 1 : 0)
-            errors_deltas << (initial_result.error? ? 1 : 0)
-            skips_deltas << (initial_result.skipped? ? 1 : 0)
-            requeues_deltas << 0
-            discards_deltas << (is_discard ? 1 : 0)
+            passes_deltas << (result_type == ResultType::Passed ? 1 : 0)
+            failures_deltas << (result_type == ResultType::Failed ? 1 : 0)
+            errors_deltas << (result_type == ResultType::Error ? 1 : 0)
+            skips_deltas << (result_type == ResultType::Skipped ? 1 : 0)
+            requeues_deltas << 0  # Requeues handled separately
+            discards_deltas << (result_type == ResultType::Discarded ? 1 : 0)
           end
 
           # Call Lua script to atomically xack + increment counters
@@ -649,6 +650,8 @@ module Minitest
           runnable_results = []
 
           # Add requeue results
+          # For requeues, we need to manually update stats (they don't go through xack Lua script)
+          requeue_stats_updates = []
           requeue_commits.each do |_entry_id, (enqueued_runnable, result, sadd_future)|
             commit = EnqueuedRunnable::Result::Commit.new { sadd_future.value > 0 }
             runnable_results << EnqueuedRunnable::Result.new(
@@ -656,15 +659,35 @@ module Minitest
               initial_result: result,
               commit: commit,
             )
+
+            # Track which requeues succeeded so we can update stats
+            if sadd_future.value > 0
+              requeue_stats_updates << result
+            end
+          end
+
+          # Update stats for successful requeues
+          if requeue_stats_updates.any?
+            redis.multi do |pipeline|
+              requeue_stats_updates.each do |result|
+                pipeline.incrby(key("runs"), 1)
+                pipeline.incrby(key("assertions"), result.assertions)
+                pipeline.incrby(key("requeues"), 1)
+              end
+            end
           end
 
           # Add xack results
-          # Note: xack returning 0 means "already acked" (idempotent retry), which is SUCCESS
-          # We only treat it as failure if there's an actual error
+          # xack returning 0 means "already acked" - this can happen in two scenarios:
+          # 1. Retry after timeout (idempotent) - Lua script won't double-count
+          # 2. Another worker already acked it (too slow) - Lua script won't double-count
+          # In both cases, stats are handled correctly by Lua. But for case 2, we still
+          # want to create a Discard to warn the user that this worker was too slow.
+          # So we treat xack=0 as commit failure at the application level (creates Discard),
+          # while the Lua script ensures no double-counting in Redis.
           xack_runnables.each_with_index do |(enqueued_runnable, result), idx|
             ack_result = ack_results[idx]
-            # Both 0 and 1 are success: 1 = newly acked, 0 = already acked (retry)
-            commit = EnqueuedRunnable::Result::Commit.new { ack_result == 0 || ack_result == 1 }
+            commit = EnqueuedRunnable::Result::Commit.new { ack_result == 1 }
             runnable_results << EnqueuedRunnable::Result.new(
               enqueued_runnable: enqueued_runnable,
               initial_result: result,
