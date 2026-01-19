@@ -3,6 +3,7 @@
 
 require "redis"
 require "set"
+require "logger"
 
 module Minitest
   module Distributed
@@ -268,7 +269,24 @@ module Minitest
 
         sig { returns(Redis) }
         def redis
-          @redis ||= Redis.new(url: configuration.coordinator_uri.to_s)
+          @redis ||= Redis.new(
+            url: configuration.coordinator_uri.to_s,
+            middlewares: custom_middlewares,
+            custom: custom_config,
+          )
+        end
+
+        sig { returns(T.nilable(T::Array[Module])) }
+        def custom_middlewares
+          return unless ENV.key?("MINITEST_DISTRIBUTED_REDIS_LOG")
+
+          require_relative "redis_instrumentation_middleware"
+          [RedisInstrumentationMiddleware]
+        end
+
+        sig { returns(T.nilable(T::Hash[Symbol, File])) }
+        def custom_config
+          { log_file: logger }.compact
         end
 
         sig { returns(String) }
@@ -515,6 +533,13 @@ module Minitest
           end
 
           adjust_combined_results(batch_result_aggregate)
+        end
+
+        sig { returns(T.nilable(Logger)) }
+        def logger
+          return unless (log_path = ENV["MINITEST_DISTRIBUTED_REDIS_LOG"])
+
+          @logger ||= T.let(Logger.new(log_path), T.nilable(Logger))
         end
 
         INITIAL_BACKOFF = 10 # milliseconds

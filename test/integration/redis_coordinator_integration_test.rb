@@ -341,4 +341,27 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     assert_includes(output, "/100] PassingTests#test_pass_0")
     assert_includes(output, "/100] PassingTests#test_pass_99")
   end
+
+  def test_with_redis_log
+    # When we boot workers in our test suite, we pipe the output. As a result, STDOUT is
+    # not a TTY, and by default progress reporting is disabled. This has caused issues in
+    # the past. In this test, we explicitly enable progress reporting so we can exercise
+    # this code even when the output will not be sent to a TTY.
+    Tempfile.open("test_with_redis_log") do |f|
+      workers = spawn_redis_workers(
+        count: 2,
+        test_file: "passing_tests.rb",
+        run_id: "test_with_progress",
+        arguments: { "--test-batch-size" => "5" },
+        env: { "MINITEST_DISTRIBUTED_REDIS_LOG" => f.path },
+      ).map(&:value)
+
+      assert_all_workers_successful(workers)
+
+      log = File.read(T.must(f.path))
+      assert_includes(log, "xpending")
+      assert_includes(log, "mget")
+      assert_includes(log, "xack")
+    end
+  end
 end
