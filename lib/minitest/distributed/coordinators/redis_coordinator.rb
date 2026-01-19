@@ -273,6 +273,7 @@ module Minitest
             url: configuration.coordinator_uri.to_s,
             middlewares: custom_middlewares,
             custom: custom_config,
+            timeout: 2,
           )
         end
 
