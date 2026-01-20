@@ -5,3 +5,4 @@ type: ruby
 up:
   - ruby
   - bundler
+  - redis
