@@ -24,6 +24,9 @@ module Minitest
             test_batch_size: Integer(env["MINITEST_TEST_BATCH_SIZE"] || DEFAULT_BATCH_SIZE),
             max_attempts: Integer(env["MINITEST_MAX_ATTEMPTS"] || DEFAULT_MAX_ATTEMPTS),
             max_failures: (max_failures_env = env["MINITEST_MAX_FAILURES"]) ? Integer(max_failures_env) : nil,
+            lazy_load: env["MINITEST_LAZY_LOAD"] == "true",
+            test_helpers: (test_helpers_env = env["MINITEST_TEST_HELPERS"]) ? test_helpers_env.split(",").map(&:strip) : [],
+            test_files: (test_files_env = env["MINITEST_TEST_FILES"]) ? test_files_env.split(",").map(&:strip) : [],
           )
         end
 
@@ -83,6 +86,25 @@ module Minitest
             configuration.shuffle_suites = enabled
           end
 
+          opts.on("--[no-]lazy-load", "Lazy load test files on workers (default: disabled)") do |enabled|
+            configuration.lazy_load = enabled
+          end
+
+          opts.on(
+            "--test-helpers=FILES",
+            "Comma-separated list of helper files to load before tests (used with --lazy-load)",
+          ) do |files|
+            configuration.test_helpers = files.split(",").map(&:strip)
+          end
+
+          opts.on(
+            "--test-files=FILES",
+            "Comma-separated list of test files to run (used with --lazy-load). " \
+              "Set automatically when using RakeIntegration.",
+          ) do |files|
+            configuration.test_files = files.split(",").map(&:strip)
+          end
+
           configuration
         end
       end
@@ -102,6 +124,9 @@ module Minitest
       prop :exclude_file, T.nilable(String)
       prop :include_file, T.nilable(String)
       prop :shuffle_suites, T::Boolean, default: true
+      prop :lazy_load, T::Boolean, default: false
+      prop :test_helpers, T::Array[String], default: []
+      prop :test_files, T::Array[String], default: []
 
       sig { returns(Coordinators::CoordinatorInterface) }
       def coordinator

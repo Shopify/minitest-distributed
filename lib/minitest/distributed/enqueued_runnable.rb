@@ -27,6 +27,8 @@ module Minitest
       end
     end
 
+    class LazyLoadError < StandardError; end
+
     # This module defines some helper methods to deal with Minitest::Runnable
     module DefinedRunnable
       extend T::Sig
@@ -35,6 +37,32 @@ module Minitest
       def self.find_class(name)
         name.split("::")
           .reduce(Object) { |ns, const| ns.const_get(const) } # rubocop:disable Sorbet/ConstantsFromStrings
+      end
+
+      sig { params(name: String, manifest: T::Hash[String, String]).void }
+      def self.load_class_from_manifest(name, manifest)
+        file_path = manifest[name]
+        unless file_path
+          raise LazyLoadError, <<~MSG.chomp
+            Cannot find test file for class '#{name}'.
+            Ensure all workers use the same test files and restart the test run.
+          MSG
+        end
+
+        # Use `load` instead of `require` - the file may already be partially loaded
+        load(file_path)
+      end
+
+      sig { params(name: String).returns(T::Boolean) }
+      def self.class_defined?(name)
+        name.split("::").reduce(Object) do |ns, const|
+          return false unless ns.const_defined?(const, false)
+
+          ns.const_get(const, false) # rubocop:disable Sorbet/ConstantsFromStrings
+        end
+        true
+      rescue NameError
+        false
       end
 
       sig { params(runnable: Minitest::Runnable).returns(String) }
@@ -173,6 +201,11 @@ module Minitest
       sig { returns(Minitest::Runnable) }
       def instantiate_runnable
         runnable_class.new(method_name)
+      end
+
+      sig { params(manifest: T::Hash[String, String]).void }
+      def ensure_class_loaded(manifest)
+        DefinedRunnable.load_class_from_manifest(class_name, manifest)
       end
 
       sig { returns(T::Boolean) }

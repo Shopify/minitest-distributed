@@ -62,6 +62,9 @@ module Minitest
         sig { returns(T::Set[EnqueuedRunnable]) }
         attr_reader :reclaimed_failed_tests
 
+        sig { returns(T::Hash[String, String]) }
+        attr_reader :manifest
+
         sig { params(configuration: Configuration).void }
         def initialize(configuration:)
           @configuration = configuration
@@ -74,6 +77,19 @@ module Minitest
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
+          @manifest = T.let({}, T::Hash[String, String])
+          @leader = T.let(false, T::Boolean)
+          @loaded_files = T.let(Set.new, T::Set[String])
+        end
+
+        sig { override.returns(T::Boolean) }
+        def leader?
+          @leader
+        end
+
+        sig { override.returns(Integer) }
+        def files_loaded_count
+          @loaded_files.size
         end
 
         sig { override.params(reporter: Minitest::CompositeReporter, options: T::Hash[Symbol, T.untyped]).void }
@@ -153,7 +169,10 @@ module Minitest
 
           return if consumer_group_exists
 
-          tests = T.let([], T::Array[Minitest::Runnable])
+          @leader = true
+          load_test_files_for_leader if configuration.lazy_load
+
+          T.let([], T::Array[Minitest::Runnable])
           tests = if initial_attempt
             # If this is the first attempt for this run ID, we will schedule the full
             # test suite as returned by the test selector to run.
@@ -211,7 +230,13 @@ module Minitest
             T.let([], T::Array[Minitest::Runnable])
           end
 
+          test_manifest = configuration.lazy_load ? test_selector.test_manifest : {}
+
           redis.pipelined do |pipeline|
+            if configuration.lazy_load && !test_manifest.empty?
+              pipeline.hset(manifest_key, test_manifest)
+            end
+
             tests.each do |test|
               pipeline.xadd(stream_key, { class_name: T.must(test.class.name), method_name: test.name })
             end
@@ -446,6 +471,39 @@ module Minitest
           # so we can assume that all the Redis cleanup was completed.
         end
 
+        sig { void }
+        def fetch_manifest
+          @manifest = redis.hgetall(manifest_key)
+        end
+
+        sig { params(enqueued_runnable: EnqueuedRunnable).void }
+        def ensure_class_loaded_with_manifest_fetch(enqueued_runnable)
+          fetch_manifest if manifest.empty?
+
+          class_name = enqueued_runnable.class_name
+          file_path = manifest[class_name]
+
+          if file_path && !@loaded_files.include?(file_path)
+            load(file_path)
+            @loaded_files.add(file_path)
+          end
+        end
+
+        sig { returns(String) }
+        def manifest_key
+          key("manifest")
+        end
+
+        sig { void }
+        def load_test_files_for_leader
+          return if configuration.test_files.empty?
+
+          configuration.test_files.each do |file_path|
+            load(file_path)
+            @loaded_files.add(file_path)
+          end
+        end
+
         sig { params(results: ResultAggregate).void }
         def adjust_combined_results(results)
           updated = redis.multi do |pipeline|
@@ -494,6 +552,8 @@ module Minitest
 
           # Call `prerecord` on the recorder for all tests in the batch, and run them.
           results = batch.map do |enqueued_runnable|
+            ensure_class_loaded_with_manifest_fetch(enqueued_runnable) if configuration.lazy_load
+
             reporter.prerecord(enqueued_runnable.runnable_class, enqueued_runnable.method_name)
             [enqueued_runnable, enqueued_runnable.run]
           end

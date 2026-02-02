@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "set"
+
 module Minitest
   module Distributed
     module Coordinators
@@ -23,11 +25,21 @@ module Minitest
         def initialize(configuration:)
           @configuration = configuration
 
-          @leader = T.let(Mutex.new, Mutex)
+          @leader_mutex = T.let(Mutex.new, Mutex)
           @queue = T.let(Queue.new, Queue)
           @local_results = T.let(ResultAggregate.new(max_failures: configuration.max_failures), ResultAggregate)
           @aborted = T.let(false, T::Boolean)
+          @is_leader = T.let(false, T::Boolean)
+          @files_loaded_count = T.let(0, Integer)
         end
+
+        sig { override.returns(T::Boolean) }
+        def leader?
+          @is_leader
+        end
+
+        sig { override.returns(Integer) }
+        attr_reader :files_loaded_count
 
         sig { override.params(reporter: Minitest::CompositeReporter, options: T::Hash[Symbol, T.untyped]).void }
         def register_reporters(reporter:, options:)
@@ -41,9 +53,19 @@ module Minitest
 
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
-          if @leader.try_lock
+          if @leader_mutex.try_lock
+            @is_leader = true
             tests = test_selector.tests
             @local_results.size = tests.size
+
+            # Count unique source files for test classes
+            source_files = Set.new
+            tests.each do |runnable|
+              source_location = runnable.class.instance_method(runnable.name).source_location&.first
+              source_files.add(source_location) if source_location
+            end
+            @files_loaded_count = source_files.size
+
             if tests.empty?
               queue.close
             else
