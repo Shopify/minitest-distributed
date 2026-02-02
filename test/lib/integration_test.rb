@@ -16,7 +16,8 @@ class IntegrationTest < Minitest::Test
     worker_id: SecureRandom.uuid,
     arguments: {},
     timeout: 10,
-    env: {}
+    env: {},
+    lazy_load: false
   )
     Thread.new do
       Thread.current.report_on_exception = false
@@ -24,12 +25,30 @@ class IntegrationTest < Minitest::Test
       stdout_reader, stdout_writer = IO.pipe
       stdout_thread = Thread.new { stdout_reader.read }
 
+      # Build command based on lazy loading mode
+      if lazy_load
+        # Use wrapper script for lazy loading support
+        # Test files are loaded by the elected leader, not at startup
+        cmd = [
+          RbConfig.ruby,
+          File.join(TEST_FILE_FIXTURES, "runner_wrapper.rb"),
+          test_file,
+        ]
+        worker_env = env.dup
+        arguments = arguments.merge("--lazy-load" => "true")
+      else
+        cmd = [
+          RbConfig.ruby,
+          File.join(TEST_FILE_FIXTURES, test_file),
+        ]
+        worker_env = env
+      end
+
       status = nil
       begin
         pid = T.unsafe(Process).spawn(
-          env,
-          RbConfig.ruby,
-          File.join(TEST_FILE_FIXTURES, test_file),
+          worker_env,
+          *cmd,
           "--verbose",
           "--run-id",
           run_id,

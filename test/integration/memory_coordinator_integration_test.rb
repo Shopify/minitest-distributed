@@ -39,6 +39,8 @@ class MemoryCoordinatorIntegrationTest < IntegrationTest
       Run options: --verbose --run-id foo --worker-id bar --enable-distributed --seed 12345
 
       Results: 0 runs, 0 assertions, 0 passes, 0 failures, 0 errors (in 0.123s)
+
+      Worker stats:     leader, 0 files loaded, XX MB peak memory, lazy loading disabled
     EOM
   end
 
@@ -197,6 +199,8 @@ class MemoryCoordinatorIntegrationTest < IntegrationTest
   private
 
   def normalize_output(output)
-    output.gsub(/\d+\.\d+/, "0.123")
+    output
+      .gsub(/\d+\.\d+/, "0.123")
+      .gsub(/\d+ MB peak memory/, "XX MB peak memory")
   end
 end

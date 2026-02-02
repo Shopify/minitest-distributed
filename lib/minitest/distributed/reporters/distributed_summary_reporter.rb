@@ -39,6 +39,8 @@ module Minitest
             io.puts("This worker:      #{local_results} #{formatted_duration}")
             io.puts("Combined results: #{combined_results}")
           end
+
+          print_worker_stats
         end
 
         sig { override.returns(T::Boolean) }
@@ -54,6 +56,34 @@ module Minitest
         end
 
         protected
+
+        sig { void }
+        def print_worker_stats
+          coordinator = configuration.coordinator
+          role = coordinator.leader? ? "leader" : "consumer"
+          lazy_status = configuration.lazy_load ? "lazy loading enabled" : "lazy loading disabled"
+
+          io.puts
+          io.puts("Worker stats:     #{role}, #{coordinator.files_loaded_count} files loaded, " \
+            "#{peak_memory_mb} MB peak memory, #{lazy_status}")
+        end
+
+        sig { returns(Integer) }
+        def peak_memory_mb
+          if File.exist?("/proc/self/status")
+            status = File.read("/proc/self/status")
+            if (match = status.match(/VmHWM:\s*(\d+)\s*kB/))
+              return match[1].to_i / 1024
+            end
+          end
+
+          rusage = Process.getrusage
+          max_rss = rusage.maxrss
+          # maxrss is bytes on macOS, KB on Linux
+          RUBY_PLATFORM.include?("darwin") ? max_rss / (1024 * 1024) : max_rss / 1024
+        rescue StandardError
+          0
+        end
 
         sig { void }
         def print_discard_warning

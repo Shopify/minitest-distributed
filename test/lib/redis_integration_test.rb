@@ -74,7 +74,7 @@ class RedisIntegrationTest < IntegrationTest
     config.coordinator.combined_results
   end
 
-  def spawn_redis_workers(test_file:, run_id:, count:, timeout: 10, arguments: {}, env: {})
+  def spawn_redis_workers(test_file:, run_id:, count:, timeout: 10, arguments: {}, env: {}, lazy_load: false)
     count.times.map do |index|
       spawn_redis_worker(
         test_file: test_file,
@@ -82,11 +82,12 @@ class RedisIntegrationTest < IntegrationTest
         timeout: timeout,
         arguments: arguments,
         env: env.merge("WORKER_INDEX" => index.to_s),
+        lazy_load: lazy_load,
       )
     end
   end
 
-  def spawn_redis_worker(test_file:, run_id:, worker_id: SecureRandom.uuid, arguments: {}, timeout: 10, env: {})
+  def spawn_redis_worker(test_file:, run_id:, worker_id: SecureRandom.uuid, arguments: {}, timeout: 10, env: {}, lazy_load: false)
     spawn_worker(
       test_file: test_file,
       run_id: run_id,
@@ -97,6 +98,7 @@ class RedisIntegrationTest < IntegrationTest
       }.merge(arguments),
       timeout: timeout,
       env: env.merge("MINITEST_COORDINATOR" => @redis_uri),
+      lazy_load: lazy_load,
     )
   end
 end

@@ -25,6 +25,12 @@ module Minitest
     def plugin_distributed_init(options)
       return if options[:disable_distributed]
 
+      configuration = options[:distributed]
+
+      if configuration.lazy_load
+        configuration.test_helpers.each { |helper_path| require(helper_path) }
+      end
+
       Minitest.singleton_class.prepend(Minitest::Distributed::TestRunnerPatch)
 
       remove_reporter(::Rails::TestUnitReporter) if defined?(::Rails::TestUnitReporter)

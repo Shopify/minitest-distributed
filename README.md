@@ -70,7 +70,7 @@ them to fail.
   worker being broken. When the timeout passes, the other workers will assume
   that the worker running the test has crashed, and will attempt to claim this
   test. This value should be comfortably higher than your slowest test.
-- `--max-attempts=NUMBER` or `ENV[MINITEST_MAX_ATTEMPTS]` (default: 3). The
+- `--max-attempts=NUMBER` or `ENV[MINITEST_MAX_ATTEMPTS]` (default: 1). The
   maximum number of times a test is attempted to be run, before considering
   it failed. Higher values will prevent more flakiness, but will make the full
   test run slower.
@@ -87,6 +87,90 @@ them to fail.
 - `--include-file=PATH_TO_FILE`: Specify a file of tests to be included in
   the test run. The file should include test identifiers seperated by
   newlines.
+
+## Lazy Loading
+
+For large test suites, you can enable lazy loading to reduce memory usage on worker nodes. With lazy loading enabled:
+
+- The **leader** worker loads all test files to build a manifest mapping test classes to their source files
+- **Consumer** workers only load test files on-demand as they pick up tests from the queue
+
+This can provide significant memory savings for workers that don't need to run the entire test suite.
+
+### How It Works
+
+Lazy loading has two parts that work together:
+
+1. **Test file discovery** - Collecting test file paths without loading them into memory.
+   - Use `RakeIntegration.apply(t)` which automatically populates `MINITEST_TEST_FILES`, or
+   - Manually set `MINITEST_TEST_FILES` to a comma-separated list of test file paths
+
+2. **Deferred loading** - Workers only load test files when they claim tests from the queue.
+   Enable with `MINITEST_LAZY_LOAD=true`.
+
+Both parts are required for lazy loading to work. The `RakeIntegration` helper replaces
+Rake's default test loader to prevent it from immediately requiring all test files.
+If you use a custom test runner or have a different build system, you can set
+`MINITEST_TEST_FILES` directly instead.
+
+### Using with Rake::TestTask (Recommended)
+
+```ruby
+require "minitest/distributed/rake_integration"
+
+Rake::TestTask.new(:test) do |t|
+  t.libs << "test"
+  t.pattern = "test/**/*_test.rb"
+  t.warning = false
+
+  # Apply lazy loading support when enabled via environment variable.
+  # This replaces Rake's default loader to defer test file loading.
+  Minitest::Distributed::RakeIntegration.apply(t) if ENV["MINITEST_LAZY_LOAD"] == "true"
+end
+```
+
+Then run your tests with:
+
+```bash
+MINITEST_LAZY_LOAD=true \
+  MINITEST_COORDINATOR=redis://localhost/1 \
+  MINITEST_RUN_ID=$BUILD_NUMBER \
+  rake test
+```
+
+### Test Helpers
+
+Use `MINITEST_TEST_HELPERS` when your test setup files contain code that tests depend on
+but won't be autoloaded. Common examples:
+
+- Custom minitest reporters or plugins
+- Database setup and teardown
+- Shared test fixtures or factory definitions
+- Global test configuration
+
+```bash
+MINITEST_LAZY_LOAD=true \
+  MINITEST_TEST_HELPERS=test_helper \
+  MINITEST_COORDINATOR=redis://localhost/1 \
+  MINITEST_RUN_ID=$BUILD_NUMBER \
+  rake test
+```
+
+Multiple helpers can be specified as a comma-separated list: `test_helper,support/factories`.
+
+### Configuration Options
+
+- `--lazy-load` or `MINITEST_LAZY_LOAD=true`: Enable lazy loading mode
+- `--test-helpers=FILES` or `MINITEST_TEST_HELPERS`: Comma-separated list of helper files
+  to load before tests (e.g., `test_helper`)
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MINITEST_LAZY_LOAD` | Set to `true` to enable lazy loading |
+| `MINITEST_TEST_HELPERS` | Comma-separated helper files to load before tests |
+| `MINITEST_TEST_FILES` | Comma-separated test file paths. Set automatically when using `RakeIntegration`, or set manually if using a custom test runner |
 
 **Limitations**
 

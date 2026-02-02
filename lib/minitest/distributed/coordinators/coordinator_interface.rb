@@ -26,6 +26,12 @@ module Minitest
 
         sig { abstract.params(reporter: Minitest::AbstractReporter).void }
         def consume(reporter:); end
+
+        sig { abstract.returns(T::Boolean) }
+        def leader?; end
+
+        sig { abstract.returns(Integer) }
+        def files_loaded_count; end
       end
     end
   end

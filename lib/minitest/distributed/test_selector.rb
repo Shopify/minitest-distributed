@@ -66,6 +66,35 @@ module Minitest
       def tests
         select_tests(discover_tests)
       end
+
+      sig { returns(T::Hash[String, String]) }
+      def test_manifest
+        @test_manifest ||= T.let(
+          runnables.each_with_object({}) do |klass, manifest|
+            file_path = source_location_for(klass)
+            if file_path
+              class_name = T.must(klass.name)
+              if manifest.key?(class_name) && manifest[class_name] != file_path
+                warn "[minitest-distributed] WARNING: Duplicate class name '#{class_name}' " \
+                     "found in multiple files:\n  - #{manifest[class_name]}\n  - #{file_path}\n" \
+                     "Only one will be used for lazy loading. Rename one class to avoid test failures."
+              end
+              manifest[class_name] = file_path
+            end
+          end,
+          T.nilable(T::Hash[String, String]),
+        )
+      end
+
+      private
+
+      sig { params(klass: T.class_of(Minitest::Runnable)).returns(T.nilable(String)) }
+      def source_location_for(klass)
+        method_name = klass.runnable_methods.first
+        return unless method_name
+
+        klass.instance_method(method_name).source_location&.first
+      end
     end
   end
 end
