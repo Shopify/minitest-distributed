@@ -243,10 +243,17 @@ module Minitest
             # To make sure we don't end up in a busy loop overwhelming Redis with commands
             # when there is no work to do, we increase the blocking time exponentially,
             # and reset it to the initial value if we processed any tests.
-            if stale_runnables.empty? && fresh_runnables.empty?
-              exponential_backoff <<= 1
+            #
+            # The backoff is capped at MAX_BACKOFF to bound how long a worker can sit
+            # inside a single XREADGROUP BLOCK call. Without a cap, after ~15 empty
+            # iterations the worker is blocked in Redis for 5+ minutes and cannot
+            # re-check `complete?` / `abort?` until the BLOCK returns, which manifests
+            # as a long post-100% teardown hang when pipelined XACKs race the progress
+            # reporter.
+            exponential_backoff = if stale_runnables.empty? && fresh_runnables.empty?
+              next_backoff(exponential_backoff)
             else
-              exponential_backoff = INITIAL_BACKOFF
+              INITIAL_BACKOFF
             end
           end
 
@@ -543,8 +550,20 @@ module Minitest
           @logger ||= T.let(Logger.new(log_path), T.nilable(Logger))
         end
 
+        sig { params(backoff: Integer).returns(Integer) }
+        def next_backoff(backoff)
+          [backoff << 1, MAX_BACKOFF].min
+        end
+
         INITIAL_BACKOFF = 10 # milliseconds
         private_constant :INITIAL_BACKOFF
+
+        # Cap on the XREADGROUP BLOCK timeout used by `consume`. Reached after roughly
+        # 9 consecutive empty iterations (10 ms * 2^9 = 5120 ms). Bounds the worst-case
+        # time a worker can be unresponsive to `complete?` / `abort?` after the queue
+        # is drained.
+        MAX_BACKOFF = 5_000 # milliseconds
+        private_constant :MAX_BACKOFF
       end
     end
   end
