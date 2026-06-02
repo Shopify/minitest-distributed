@@ -153,63 +153,65 @@ module Minitest
 
           return if consumer_group_exists
 
-          tests = T.let([], T::Array[Minitest::Runnable])
-          tests = if initial_attempt
-            # If this is the first attempt for this run ID, we will schedule the full
-            # test suite as returned by the test selector to run.
+          tests = T.let(
+            if initial_attempt
+              # If this is the first attempt for this run ID, we will schedule the full
+              # test suite as returned by the test selector to run.
 
-            tests_from_selector = test_selector.tests
-            adjust_combined_results(ResultAggregate.new(size: tests_from_selector.size))
-            tests_from_selector
+              tests_from_selector = test_selector.tests
+              adjust_combined_results(ResultAggregate.new(size: tests_from_selector.size))
+              tests_from_selector
 
-          elsif configuration.retry_failures
-            # Before starting a retry attempt, we first check if the previous attempt
-            # was aborted before it was completed. If this is the case, we cannot use
-            # retry mode, and should immediately fail the attempt.
-            if combined_results.abort?
-              # We mark this run as aborted, which causes this worker to not be successful.
-              @aborted = true
+            elsif configuration.retry_failures
+              # Before starting a retry attempt, we first check if the previous attempt
+              # was aborted before it was completed. If this is the case, we cannot use
+              # retry mode, and should immediately fail the attempt.
+              if combined_results.abort?
+                # We mark this run as aborted, which causes this worker to not be successful.
+                @aborted = true
 
-              # We still publish an empty size run to Redis, so if there are any followers,
-              # they will wind down normally. Only the leader will exit
-              # with a non-zero exit status and fail the build; any follower will
-              # exit with status 0.
-              adjust_combined_results(ResultAggregate.new(size: 0))
-              T.let([], T::Array[Minitest::Runnable])
-            else
-              previous_failures, previous_errors, _deleted = redis.multi do |pipeline|
-                pipeline.lrange(list_key(ResultType::Failed.serialize), 0, -1)
-                pipeline.lrange(list_key(ResultType::Error.serialize), 0, -1)
-                pipeline.del(list_key(ResultType::Failed.serialize), list_key(ResultType::Error.serialize))
+                # We still publish an empty size run to Redis, so if there are any followers,
+                # they will wind down normally. Only the leader will exit
+                # with a non-zero exit status and fail the build; any follower will
+                # exit with status 0.
+                adjust_combined_results(ResultAggregate.new(size: 0))
+                []
+              else
+                previous_failures, previous_errors, _deleted = redis.multi do |pipeline|
+                  pipeline.lrange(list_key(ResultType::Failed.serialize), 0, -1)
+                  pipeline.lrange(list_key(ResultType::Error.serialize), 0, -1)
+                  pipeline.del(list_key(ResultType::Failed.serialize), list_key(ResultType::Error.serialize))
+                end
+
+                # We set the `size` key to the number of tests we are planning to schedule.
+                # We also adjust the number of failures and errors back to 0.
+                # We set the number of requeues to the number of tests that failed, so the
+                # run statistics will reflect that we retried some failed test.
+                #
+                # However, normally requeues are not acked, as we expect the test to be acked
+                # by another worker later. This makes the test loop think iot is already done.
+                # To prevent this, we initialize the number of acks negatively, so it evens out
+                # in the statistics.
+                total_failures = previous_failures.length + previous_errors.length
+                adjust_combined_results(ResultAggregate.new(
+                  size: total_failures,
+                  failures: -previous_failures.length,
+                  errors: -previous_errors.length,
+                  requeues: total_failures,
+                ))
+
+                # For subsequent attempts, we check the list of previous failures and
+                # errors, and only schedule to re-run those tests. This allows for faster
+                # retries of potentially flaky tests.
+                test_identifiers_to_retry = T.let(previous_failures + previous_errors, T::Array[String])
+                test_identifiers_to_retry.map { |identifier| DefinedRunnable.from_identifier(identifier) }
               end
-
-              # We set the `size` key to the number of tests we are planning to schedule.
-              # We also adjust the number of failures and errors back to 0.
-              # We set the number of requeues to the number of tests that failed, so the
-              # run statistics will reflect that we retried some failed test.
-              #
-              # However, normally requeues are not acked, as we expect the test to be acked
-              # by another worker later. This makes the test loop think iot is already done.
-              # To prevent this, we initialize the number of acks negatively, so it evens out
-              # in the statistics.
-              total_failures = previous_failures.length + previous_errors.length
-              adjust_combined_results(ResultAggregate.new(
-                size: total_failures,
-                failures: -previous_failures.length,
-                errors: -previous_errors.length,
-                requeues: total_failures,
-              ))
-
-              # For subsequent attempts, we check the list of previous failures and
-              # errors, and only schedule to re-run those tests. This allows for faster
-              # retries of potentially flaky tests.
-              test_identifiers_to_retry = T.let(previous_failures + previous_errors, T::Array[String])
-              test_identifiers_to_retry.map { |identifier| DefinedRunnable.from_identifier(identifier) }
-            end
-          else
-            adjust_combined_results(ResultAggregate.new(size: 0))
-            T.let([], T::Array[Minitest::Runnable])
-          end
+            else
+              adjust_combined_results(ResultAggregate.new(size: 0))
+              []
+            end,
+            T::Array[Minitest::Runnable],
+          )
 
           redis.pipelined do |pipeline|
             tests.each do |test|
@@ -243,10 +245,17 @@ module Minitest
             # To make sure we don't end up in a busy loop overwhelming Redis with commands
             # when there is no work to do, we increase the blocking time exponentially,
             # and reset it to the initial value if we processed any tests.
-            if stale_runnables.empty? && fresh_runnables.empty?
-              exponential_backoff <<= 1
+            #
+            # The backoff is capped at MAX_BACKOFF to bound how long a worker can sit
+            # inside a single XREADGROUP BLOCK call. Without a cap, after ~15 empty
+            # iterations the worker is blocked in Redis for 5+ minutes and cannot
+            # re-check `complete?` / `abort?` until the BLOCK returns, which manifests
+            # as a long post-100% teardown hang when pipelined XACKs race the progress
+            # reporter.
+            exponential_backoff = if stale_runnables.empty? && fresh_runnables.empty?
+              next_backoff(exponential_backoff)
             else
-              exponential_backoff = INITIAL_BACKOFF
+              INITIAL_BACKOFF
             end
           end
 
@@ -543,8 +552,20 @@ module Minitest
           @logger ||= T.let(Logger.new(log_path), T.nilable(Logger))
         end
 
+        sig { params(backoff: Integer).returns(Integer) }
+        def next_backoff(backoff)
+          [backoff << 1, MAX_BACKOFF].min
+        end
+
         INITIAL_BACKOFF = 10 # milliseconds
         private_constant :INITIAL_BACKOFF
+
+        # Cap on the XREADGROUP BLOCK timeout used by `consume`. Reached after roughly
+        # 9 consecutive empty iterations (10 ms * 2^9 = 5120 ms). Bounds the worst-case
+        # time a worker can be unresponsive to `complete?` / `abort?` after the queue
+        # is drained.
+        MAX_BACKOFF = 5_000 # milliseconds
+        private_constant :MAX_BACKOFF
       end
     end
   end
