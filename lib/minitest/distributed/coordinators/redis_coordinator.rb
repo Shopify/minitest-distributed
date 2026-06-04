@@ -286,7 +286,7 @@ module Minitest
           )
         end
 
-        sig { returns(T.nilable(T::Array[Module])) }
+        sig { returns(T.nilable(T::Array[T.untyped])) }
         def custom_middlewares
           return unless ENV.key?("MINITEST_DISTRIBUTED_REDIS_LOG")
 

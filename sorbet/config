@@ -1,3 +1,5 @@
 --dir
 .
 --ignore=vendor
+--typed-override
+sorbet/typed_overrides.yaml

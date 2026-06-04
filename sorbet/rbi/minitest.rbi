@@ -1,4 +1,4 @@
-# typed: strict
+# typed: true
 
 module Minitest
   class Runnable
@@ -171,7 +171,7 @@ module Minitest::Assertions
 
   sig do
     params(
-      collection: T::Enumerable[T.untyped],
+      collection: T.untyped,
       obj: BasicObject,
       msg: T.nilable(String)
     ).returns(TrueClass)
@@ -188,10 +188,11 @@ module Minitest::Assertions
 
   sig do
     params(
-      exp: T.untyped
+      exp: T.untyped,
+      blk: T.untyped
     ).returns(TrueClass)
   end
-  def assert_raises(*exp); end
+  def assert_raises(*exp, &blk); end
 
   sig do
     params(
