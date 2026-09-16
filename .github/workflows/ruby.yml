@@ -20,6 +20,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - name: Trust checkout inside container
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
     - name: Install dependencies
       run: gem install bundler -v 2.4.22 && bundle install
     - name: Run tests

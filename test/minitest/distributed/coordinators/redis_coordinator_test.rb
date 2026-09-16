@@ -56,7 +56,7 @@ module Minitest
           @coordinator.define_singleton_method(:process_batch) { |*_| }
           @coordinator.define_singleton_method(:cleanup) {}
           @coordinator.define_singleton_method(:current_production_heartbeat) { nil }
-          @coordinator.define_singleton_method(:run_complete?) { |results| results.complete? }
+          @coordinator.define_singleton_method(:run_complete?, &:complete?)
 
           fake_results = Object.new
           fake_results.define_singleton_method(:complete?) do

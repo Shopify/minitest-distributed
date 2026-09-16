@@ -244,6 +244,9 @@ module Minitest
           stop_production_heartbeat(production_heartbeat_thread) if production_heartbeat_thread
         end
 
+        # The loop intentionally keeps the stale/fresh claim and diagnostic state
+        # transitions together so each iteration observes one coherent snapshot.
+        # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
           exponential_backoff = INITIAL_BACKOFF
@@ -398,6 +401,7 @@ module Minitest
             raise
           end
         end
+        # rubocop:enable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
 
         private
 
@@ -1361,25 +1365,25 @@ module Minitest
             T::Array[T.untyped],
           )
           results.each do |enqueued_runnable, result|
-            arguments.concat([
+            arguments.push(
               enqueued_runnable.entry_id,
               ResultType.of(result).serialize,
               enqueued_runnable.attempt_id,
               enqueued_runnable.identifier,
               result.assertions,
-            ])
+            )
           end
 
           keys = [stream_key, key("retry_set")]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.concat([
+          keys.push(
             key("production_complete"),
             key("stalled"),
             key("production_heartbeat"),
             key("attempt_generation"),
             key("truncated"),
-          ])
+          )
 
           response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
           commit_statuses = T.cast(response.take(results.size), T::Array[Integer])
