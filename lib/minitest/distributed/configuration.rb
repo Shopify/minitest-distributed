@@ -11,6 +11,12 @@ module Minitest
       DEFAULT_MAX_ATTEMPTS = 1
       DEFAULT_TEST_TIMEOUT_SECONDS = 30.0 # seconds
 
+      # Expiry applied to every Redis key the coordinator writes, refreshed on
+      # every write, so a finished run's bookkeeping does not live in the
+      # coordinator forever. See `RedisCoordinator#refresh_key_ttls`.
+      DEFAULT_KEY_TTL_SECONDS = 86_400 # 24 hours
+      DEFAULT_STALL_TIMEOUT_SECONDS = 300.0 # 5 minutes
+
       class << self
         extend T::Sig
 
@@ -24,6 +30,8 @@ module Minitest
             test_batch_size: Integer(env["MINITEST_TEST_BATCH_SIZE"] || DEFAULT_BATCH_SIZE),
             max_attempts: Integer(env["MINITEST_MAX_ATTEMPTS"] || DEFAULT_MAX_ATTEMPTS),
             max_failures: (max_failures_env = env["MINITEST_MAX_FAILURES"]) ? Integer(max_failures_env) : nil,
+            key_ttl_seconds: Integer(env["MINITEST_KEY_TTL_SECONDS"] || DEFAULT_KEY_TTL_SECONDS),
+            stall_timeout_seconds: Float(env["MINITEST_STALL_TIMEOUT_SECONDS"] || DEFAULT_STALL_TIMEOUT_SECONDS),
           )
         end
 
@@ -83,6 +91,14 @@ module Minitest
             configuration.shuffle_suites = enabled
           end
 
+          opts.on("--key-ttl=SECONDS", "Expiry for the coordinator's Redis keys, refreshed on every write") do |ttl|
+            configuration.key_ttl_seconds = Integer(ttl)
+          end
+
+          opts.on("--stall-timeout=SECONDS", "Abort a drained Redis queue that has stopped making progress") do |timeout|
+            configuration.stall_timeout_seconds = Float(timeout)
+          end
+
           configuration
         end
       end
@@ -102,9 +118,12 @@ module Minitest
       prop :exclude_file, T.nilable(String)
       prop :include_file, T.nilable(String)
       prop :shuffle_suites, T::Boolean, default: true
+      prop :key_ttl_seconds, Integer, default: DEFAULT_KEY_TTL_SECONDS
+      prop :stall_timeout_seconds, Float, default: DEFAULT_STALL_TIMEOUT_SECONDS
 
       sig { returns(Coordinators::CoordinatorInterface) }
       def coordinator
+        validate!
         @coordinator ||= T.let(
           case coordinator_uri.scheme
           when "redis"
@@ -116,6 +135,15 @@ module Minitest
           end,
           T.nilable(Coordinators::CoordinatorInterface),
         )
+      end
+
+      sig { void }
+      def validate!
+        raise ArgumentError, "key_ttl_seconds must be greater than zero" unless key_ttl_seconds.positive?
+
+        unless stall_timeout_seconds.positive? && stall_timeout_seconds.finite?
+          raise ArgumentError, "stall_timeout_seconds must be finite and greater than zero"
+        end
       end
     end
   end

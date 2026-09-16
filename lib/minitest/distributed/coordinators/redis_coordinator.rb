@@ -44,6 +44,15 @@ module Minitest
         extend T::Sig
         include CoordinatorInterface
 
+        class StallProbe < T::Struct
+          const :acks, T.nilable(Integer)
+          const :size, T.nilable(Integer)
+          const :pending_count, Integer
+          const :lag, T.nilable(Integer)
+          const :production_complete, T::Boolean
+        end
+        private_constant :StallProbe
+
         sig { returns(Configuration) }
         attr_reader :configuration
 
@@ -62,6 +71,9 @@ module Minitest
         sig { returns(T::Set[EnqueuedRunnable]) }
         attr_reader :reclaimed_failed_tests
 
+        sig { returns(T.nilable(String)) }
+        attr_reader :stall_diagnostic
+
         sig { params(configuration: Configuration).void }
         def initialize(configuration:)
           @configuration = configuration
@@ -74,10 +86,13 @@ module Minitest
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
+          @stall_diagnostic = T.let(nil, T.nilable(String))
+          @output = T.let(nil, T.untyped)
         end
 
         sig { override.params(reporter: Minitest::CompositeReporter, options: T::Hash[Symbol, T.untyped]).void }
         def register_reporters(reporter:, options:)
+          @output = options[:io]
           reporter << Reporters::RedisCoordinatorWarningsReporter.new(options[:io], options)
         end
 
@@ -123,6 +138,11 @@ module Minitest
           @aborted
         end
 
+        sig { returns(T::Boolean) }
+        def stalled?
+          !stall_diagnostic.nil?
+        end
+
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
           # Whoever ends up creating the consumer group will act as leader,
@@ -135,8 +155,8 @@ module Minitest
             # fails, and the DEL never gets executed for followers.
             keys_deleted = redis.evalsha(
               register_consumergroup_script,
-              keys: [stream_key, key("size"), key("acks")],
-              argv: [group_name],
+              keys: [stream_key, key("size"), key("acks"), key("production_complete")],
+              argv: [group_name, configuration.key_ttl_seconds],
             )
             keys_deleted == 0
           rescue Redis::CommandError => ce
@@ -154,7 +174,13 @@ module Minitest
           return if consumer_group_exists
 
           tests = T.let(
-            if initial_attempt
+            if redis.exists?(key("stalled"))
+              # A previous attempt lost coordinator state, so its failure lists and
+              # statistics cannot be trusted as the basis for a selective retry.
+              @aborted = true
+              adjust_combined_results(ResultAggregate.new(size: 0))
+              []
+            elsif initial_attempt
               # If this is the first attempt for this run ID, we will schedule the full
               # test suite as returned by the test selector to run.
 
@@ -217,12 +243,21 @@ module Minitest
             tests.each do |test|
               pipeline.xadd(stream_key, { class_name: T.must(test.class.name), method_name: test.name })
             end
+            pipeline.set(key("production_complete"), "1", ex: configuration.key_ttl_seconds)
           end
         end
 
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
           exponential_backoff = INITIAL_BACKOFF
+          last_progress_at = monotonic_time
+          initial_results = combined_results
+          observed_acks = T.let(initial_results.acks, T.nilable(Integer))
+          observed_size = T.let(initial_results.size, T.nilable(Integer))
+          pending_stall_warning_emitted = T.let(false, T::Boolean)
+          drained_mismatch_detected_at = T.let(nil, T.nilable(Float))
+          incomplete_production_detected_at = T.let(nil, T.nilable(Float))
+
           loop do
             # First, see if there are any pending tests from other workers to claim.
             stale_runnables = claim_stale_runnables
@@ -232,15 +267,92 @@ module Minitest
             fresh_runnables = claim_fresh_runnables(block: exponential_backoff)
             process_batch(fresh_runnables, reporter)
 
+            run_results = combined_results
+
             # If we have acked the same amount of tests as we were supposed to, the run
             # is complete and we can exit our loop. Generally, only one worker will detect
-            # this condition. The pther workers will quit their consumer loop because the
-            # consumergroup will be deleted by the first worker, and their Redis commands
+            # this condition. The other workers will quit their consumer loop because the
+            # consumer group will be deleted by the first worker, and their Redis commands
             # will start to fail - see the rescue block below.
-            break if combined_results.complete?
+            break if run_results.complete?
 
-            # We also abort a run if we reach the maximum number of failures
-            break if combined_results.abort?
+            # We also abort a run if we reach the maximum number of failures.
+            break if run_results.abort?
+
+            processed_batch = stale_runnables.any? || fresh_runnables.any?
+            if processed_batch
+              last_progress_at = monotonic_time
+              observed_acks = run_results.acks
+              observed_size = run_results.size
+              drained_mismatch_detected_at = nil
+              incomplete_production_detected_at = nil
+            else
+              now = monotonic_time
+              confirmation_interval = [configuration.stall_timeout_seconds, STALL_CONFIRMATION_SECONDS].min
+              confirmation_due = if drained_mismatch_detected_at
+                now - drained_mismatch_detected_at >= confirmation_interval
+              elsif incomplete_production_detected_at
+                now - incomplete_production_detected_at >= configuration.stall_timeout_seconds
+              else
+                true
+              end
+
+              if now - last_progress_at >= configuration.stall_timeout_seconds && confirmation_due
+                probe = probe_stall
+                @combined_results = nil
+
+                # Another worker may have completed the run while our memoized aggregate
+                # was stale. Treat the fresh counters as authoritative.
+                if !probe.acks.nil? && probe.acks == probe.size
+                  break
+                end
+
+                counters_changed = probe.acks != observed_acks || probe.size != observed_size
+                if counters_changed
+                  observed_acks = probe.acks
+                  observed_size = probe.size
+                end
+
+                stream_empty = probe.pending_count.zero? && probe.lag == 0
+                if probe.production_complete && stream_empty
+                  incomplete_production_detected_at = nil
+                  if drained_mismatch_detected_at && !counters_changed
+                    abort_stalled_run(probe)
+                    break
+                  else
+                    # The probe is pipelined rather than transactional. Confirm an
+                    # unchanged mismatch so a final atomic commit interleaved with the
+                    # probe cannot cause a false abort.
+                    drained_mismatch_detected_at = now
+                  end
+                elsif !probe.production_complete && stream_empty
+                  drained_mismatch_detected_at = nil
+                  if incomplete_production_detected_at && !counters_changed
+                    abort_stalled_run(probe)
+                    break
+                  else
+                    # The leader may still be selecting tests. Give production a
+                    # second full stall interval, but do not wait forever if the
+                    # leader died or this marker was itself evicted.
+                    incomplete_production_detected_at = now
+                  end
+                else
+                  drained_mismatch_detected_at = nil
+                  incomplete_production_detected_at = nil
+
+                  if probe.pending_count > 0 && !pending_stall_warning_emitted
+                    emit_message(format_pending_stall_warning(probe))
+                    pending_stall_warning_emitted = true
+                  end
+
+                  # A non-empty PEL may be waiting for the legitimate
+                  # test_timeout_seconds * test_batch_size reclaim path. Undelivered
+                  # entries can likewise be claimed by another worker. Wait another
+                  # full interval before probing again.
+                  last_progress_at = now
+                end
+              end
+            end
 
             # To make sure we don't end up in a busy loop overwhelming Redis with commands
             # when there is no work to do, we increase the blocking time exponentially,
@@ -252,23 +364,19 @@ module Minitest
             # re-check `complete?` / `abort?` until the BLOCK returns, which manifests
             # as a long post-100% teardown hang when pipelined XACKs race the progress
             # reporter.
-            exponential_backoff = if stale_runnables.empty? && fresh_runnables.empty?
-              next_backoff(exponential_backoff)
-            else
+            exponential_backoff = if processed_batch
               INITIAL_BACKOFF
+            else
+              next_backoff(exponential_backoff)
             end
           end
 
           cleanup
         rescue Redis::CommandError => ce
-          if ce.message.start_with?("NOGROUP")
-            # When a redis conumer group commands fails with a NOGROUP error, we assume the
-            # consumer group was deleted by the first worker that detected the run is complete.
-            # So this worker can exit its loop as well.
-
-            # We have to invalidate the local combined_results cache so we get fresh
-            # final values from Redis when we try to report results in our summarizer.
-            @combined_results = nil
+          if ce.message.start_with?("NOGROUP") || ce.message.include?("no such key")
+            # A normal cleanup and an evicted/deleted stream produce the same Redis
+            # errors. Fresh counters distinguish a terminal run from data loss.
+            handle_missing_stream_error(ce)
           else
             raise
           end
@@ -307,11 +415,78 @@ module Minitest
             -- means another worker will be acting as leader.
             -- In that case, the next Redis DEL call will not be executed.
             redis.call('XGROUP', 'CREATE', KEYS[1], ARGV[1], '0', 'MKSTREAM')
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
 
-            -- The leader should reset the size and acks key for this run attempt.
-            -- We return the number of keys that were deleted, which can be used to
-            -- determine whether this was the first attempt for this run or not.
-            return redis.call('DEL', KEYS[2], KEYS[3])
+            -- The leader should reset the size, acks and production marker for this
+            -- run attempt. Only size and acks determine whether this is a retry.
+            local attempt_keys_deleted = redis.call('DEL', KEYS[2], KEYS[3])
+            redis.call('DEL', KEYS[4])
+            return attempt_keys_deleted
+          LUA
+        end
+
+        sig { returns(String) }
+        def commit_results_script
+          @commit_results_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
+            local result_count = tonumber(ARGV[3])
+            local argument_index = 4
+            local commit_results = {}
+            -- runs, assertions, passes, failures, errors, skips, requeues,
+            -- discards, acks, size
+            local deltas = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+            for result_index = 1, result_count do
+              local entry_id = ARGV[argument_index]
+              local result_type = ARGV[argument_index + 1]
+              local attempt_id = ARGV[argument_index + 2]
+              local identifier = ARGV[argument_index + 3]
+              local assertions = tonumber(ARGV[argument_index + 4])
+              argument_index = argument_index + 5
+
+              local committed
+              if result_type == 'requeued' then
+                committed = redis.call('SADD', KEYS[2], attempt_id)
+                deltas[7] = deltas[7] + 1
+              else
+                committed = redis.call('XACK', KEYS[1], ARGV[1], entry_id)
+                if committed == 1 then
+                  deltas[9] = deltas[9] + 1
+                  if result_type == 'passed' then
+                    deltas[3] = deltas[3] + 1
+                  elseif result_type == 'failed' then
+                    deltas[4] = deltas[4] + 1
+                    redis.call('LPUSH', KEYS[14], identifier)
+                  elseif result_type == 'error' then
+                    deltas[5] = deltas[5] + 1
+                    redis.call('LPUSH', KEYS[15], identifier)
+                  elseif result_type == 'skipped' then
+                    deltas[6] = deltas[6] + 1
+                    redis.call('LPUSH', KEYS[13], identifier)
+                  elseif result_type == 'discarded' then
+                    deltas[8] = deltas[8] + 1
+                  end
+                else
+                  -- Another worker already ACKed this entry, so the local result
+                  -- will be reported as discarded.
+                  deltas[8] = deltas[8] + 1
+                end
+              end
+
+              deltas[1] = deltas[1] + 1
+              deltas[2] = deltas[2] + assertions
+              commit_results[result_index] = committed
+            end
+
+            local reply = commit_results
+            for stat_index = 1, 10 do
+              reply[result_count + stat_index] = redis.call('INCRBY', KEYS[stat_index + 2], deltas[stat_index])
+            end
+
+            for key_index = 1, #KEYS do
+              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+            end
+
+            return reply
           LUA
         end
 
@@ -446,6 +621,112 @@ module Minitest
           enqueued_runnables
         end
 
+        # Read all the state needed to distinguish a legitimately slow pending
+        # test from a drained queue whose completion counters can no longer agree.
+        # This deliberately bypasses `@combined_results`, which is memoized.
+        sig { returns(StallProbe) }
+        def probe_stall
+          counters, pending_summary, groups, stream_info = redis.pipelined do |pipeline|
+            pipeline.mget(key("acks"), key("size"), key("production_complete"))
+            pipeline.xpending(stream_key, group_name)
+            pipeline.xinfo("groups", stream_key)
+            pipeline.xinfo("stream", stream_key)
+          end
+
+          raw_acks, raw_size, raw_production_complete = T.unsafe(counters)
+          group = T.unsafe(groups).find { |candidate| candidate.fetch("name") == group_name }
+          raw_lag = group&.fetch("lag", nil)
+          lag = raw_lag.nil? ? nil : Integer(raw_lag)
+
+          # Redis added the explicit group lag field in version 7. On older
+          # versions, equal delivery and stream IDs still prove that there are no
+          # undelivered entries because this coordinator never trims the stream.
+          if lag.nil? && group && group.fetch("last-delivered-id") == T.unsafe(stream_info).fetch("last-generated-id")
+            lag = 0
+          end
+
+          StallProbe.new(
+            acks: raw_acks.nil? ? nil : Integer(raw_acks),
+            size: raw_size.nil? ? nil : Integer(raw_size),
+            pending_count: Integer(T.unsafe(pending_summary).fetch("size")),
+            lag: lag,
+            production_complete: !raw_production_complete.nil?,
+          )
+        end
+
+        sig { params(probe: StallProbe).void }
+        def abort_stalled_run(probe)
+          abort_with_diagnostic(format_stall_diagnostic(probe))
+        end
+
+        sig { params(error: Redis::CommandError).void }
+        def handle_missing_stream_error(error)
+          @combined_results = nil
+          results = combined_results
+          return if results.complete? || results.abort?
+
+          state = "run_id=#{configuration.run_id} worker_id=#{configuration.worker_id} " \
+            "acks=#{results.acks} size=#{results.size} redis_error=#{error.message.inspect}"
+          diagnostic = <<~DIAGNOSTIC
+            ERROR: minitest-distributed lost its Redis stream or consumer group and aborted the run.
+            #{state}
+            The run is incomplete, so this was not normal cleanup. The stream may have been evicted or deleted.
+          DIAGNOSTIC
+          abort_with_diagnostic(diagnostic)
+        end
+
+        sig { params(diagnostic: String).void }
+        def abort_with_diagnostic(diagnostic)
+          redis.set(key("stalled"), "1", ex: configuration.key_ttl_seconds)
+          @aborted = true
+          @stall_diagnostic = diagnostic
+          emit_message(diagnostic)
+        end
+
+        sig { params(probe: StallProbe).returns(String) }
+        def format_stall_diagnostic(probe)
+          <<~DIAGNOSTIC
+            ERROR: minitest-distributed detected inconsistent Redis coordinator state and aborted the run.
+            #{format_probe_state(probe)}
+            The consumer group has no pending or undelivered tests, but acks does not equal size.
+            One or more coordinator keys may have been evicted or deleted; the run cannot make further progress.
+          DIAGNOSTIC
+        end
+
+        sig { params(probe: StallProbe).returns(String) }
+        def format_pending_stall_warning(probe)
+          timeout = format("%g", configuration.stall_timeout_seconds)
+          reclaim_after = format("%g", configuration.test_timeout_seconds * configuration.test_batch_size)
+          <<~WARNING
+            WARNING: minitest-distributed has made no progress for #{timeout}s, but Redis still has pending tests.
+            #{format_probe_state(probe)}
+            The worker will keep waiting; pending tests become reclaimable after approximately #{reclaim_after}s.
+          WARNING
+        end
+
+        sig { params(probe: StallProbe).returns(String) }
+        def format_probe_state(probe)
+          "run_id=#{configuration.run_id} worker_id=#{configuration.worker_id} " \
+            "acks=#{format_probe_value(probe.acks)} size=#{format_probe_value(probe.size)} " \
+            "pending=#{probe.pending_count} lag=#{format_probe_value(probe.lag)} " \
+            "production_complete=#{probe.production_complete}"
+        end
+
+        sig { params(value: T.nilable(Integer)).returns(String) }
+        def format_probe_value(value)
+          value.nil? ? "missing" : value.to_s
+        end
+
+        sig { params(message: String).void }
+        def emit_message(message)
+          (@output || $stderr).puts(message)
+        end
+
+        sig { returns(Float) }
+        def monotonic_time
+          Process.clock_gettime(Process::CLOCK_MONOTONIC).to_f
+        end
+
         sig { void }
         def cleanup
           redis.xgroup(:destroy, stream_key, group_name)
@@ -453,6 +734,45 @@ module Minitest
         rescue Redis::CommandError
           # Apparently another consumer already removed the consumer group,
           # so we can assume that all the Redis cleanup was completed.
+        end
+
+        # The keys the coordinator writes for a run, other than the stream, are plain
+        # counters, lists and sets that intentionally survive `cleanup`: retry mode and
+        # the summary reporters read them after the stream is gone. Nothing ever removes
+        # them, so a coordinator accumulates roughly a dozen keys per run, forever.
+        #
+        # That matters most where the coordinator is a shared Redis running an
+        # `allkeys-lru` eviction policy at maxmemory, because LRU is then free to evict
+        # the keys of a *running* build. Losing one is silent and unrecoverable: a run
+        # only finishes when `acks == size`, so every worker keeps polling a drained
+        # queue, printing nothing, until CI kills it.
+        #
+        # An expiry does not stop an eviction, and is not claimed to. It bounds what a
+        # finished run leaves behind, which is the part this gem owns.
+        STATS_KEY_NAMES = T.let(
+          ["runs", "assertions", "passes", "failures", "errors", "skips", "requeues", "discards", "acks", "size"].freeze,
+          T::Array[String],
+        )
+        private_constant :STATS_KEY_NAMES
+
+        LIST_KEY_RESULT_TYPES = T.let(
+          [ResultType::Skipped, ResultType::Failed, ResultType::Error].freeze,
+          T::Array[ResultType],
+        )
+        private_constant :LIST_KEY_RESULT_TYPES
+
+        # Refreshes the expiry of every key this run owns. Issued on the caller's
+        # pipeline, so it costs no extra round trip. `EXPIRE` on a key that does not
+        # exist is a no-op, so keys the run never writes are fine.
+        sig { params(pipeline: T.untyped).void }
+        def refresh_key_ttls(pipeline)
+          ttl = configuration.key_ttl_seconds
+          pipeline.expire(stream_key, ttl)
+          pipeline.expire(key("retry_set"), ttl)
+          pipeline.expire(key("production_complete"), ttl)
+          pipeline.expire(key("stalled"), ttl)
+          STATS_KEY_NAMES.each { |name| pipeline.expire(key(name), ttl) }
+          LIST_KEY_RESULT_TYPES.each { |result_type| pipeline.expire(list_key(result_type.serialize), ttl) }
         end
 
         sig { params(results: ResultAggregate).void }
@@ -468,21 +788,15 @@ module Minitest
             pipeline.incrby(key("discards"), results.discards)
             pipeline.incrby(key("acks"), results.acks)
             pipeline.incrby(key("size"), results.size)
+
+            # Keep the run's keys on a sliding expiry. This runs after the INCRBYs so
+            # the positional results below are unaffected. Test-result commits refresh
+            # the same keys in `commit_results_script`, so they stay alive for the
+            # duration of both production and consumption.
+            refresh_key_ttls(pipeline)
           end
 
-          @combined_results = ResultAggregate.new(
-            max_failures: configuration.max_failures,
-            runs: updated[0],
-            assertions: updated[1],
-            passes: updated[2],
-            failures: updated[3],
-            errors: updated[4],
-            skips: updated[5],
-            requeues: updated[6],
-            discards: updated[7],
-            acks: updated[8],
-            size: updated[9],
-          )
+          update_combined_results(T.cast(updated.take(10), T::Array[Integer]))
         end
 
         sig { params(name: String).returns(String) }
@@ -493,6 +807,62 @@ module Minitest
         sig { params(name: String).returns(String) }
         def list_key(name)
           key("#{name}_list")
+        end
+
+        sig do
+          params(
+            results: T::Array[[EnqueuedRunnable, Minitest::Result]],
+          ).returns(T::Array[EnqueuedRunnable::Result])
+        end
+        def commit_results(results)
+          arguments = T.let(
+            [group_name, configuration.key_ttl_seconds, results.size],
+            T::Array[T.untyped],
+          )
+          results.each do |enqueued_runnable, result|
+            arguments.concat([
+              enqueued_runnable.entry_id,
+              ResultType.of(result).serialize,
+              enqueued_runnable.attempt_id,
+              enqueued_runnable.identifier,
+              result.assertions,
+            ])
+          end
+
+          keys = [stream_key, key("retry_set")]
+          keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
+          keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
+          keys.concat([key("production_complete"), key("stalled")])
+
+          response = T.unsafe(redis.evalsha(commit_results_script, keys: keys, argv: arguments))
+          commit_statuses = response.take(results.size)
+          update_combined_results(T.cast(response.drop(results.size), T::Array[Integer]))
+
+          results.each_with_index.map do |(enqueued_runnable, result), index|
+            commit = if commit_statuses.fetch(index) == 1
+              EnqueuedRunnable::Result::Commit.success
+            else
+              EnqueuedRunnable::Result::Commit.failure
+            end
+            enqueued_runnable.commit_result(result) { |_result_to_commit| commit }
+          end
+        end
+
+        sig { params(updated: T::Array[Integer]).void }
+        def update_combined_results(updated)
+          @combined_results = ResultAggregate.new(
+            max_failures: configuration.max_failures,
+            runs: updated.fetch(0),
+            assertions: updated.fetch(1),
+            passes: updated.fetch(2),
+            failures: updated.fetch(3),
+            errors: updated.fetch(4),
+            skips: updated.fetch(5),
+            requeues: updated.fetch(6),
+            discards: updated.fetch(7),
+            acks: updated.fetch(8),
+            size: updated.fetch(9),
+          )
         end
 
         sig { params(batch: T::Array[EnqueuedRunnable], reporter: AbstractReporter).void }
@@ -507,42 +877,17 @@ module Minitest
             [enqueued_runnable, enqueued_runnable.run]
           end
 
-          # Try to commit all the results of this batch to Redis
-          runnable_results = []
-          redis.multi do |pipeline|
-            results.each do |enqueued_runnable, initial_result|
-              runnable_results << enqueued_runnable.commit_result(initial_result) do |result_to_commit|
-                if ResultType.of(result_to_commit) == ResultType::Requeued
-                  sadd_future = pipeline.sadd(key("retry_set"), [enqueued_runnable.attempt_id])
-                  EnqueuedRunnable::Result::Commit.new { sadd_future.value > 0 }
-                else
-                  xack_future = pipeline.xack(stream_key, group_name, enqueued_runnable.entry_id)
-                  EnqueuedRunnable::Result::Commit.new { xack_future.value == 1 }
-                end
-              end
-            end
-          end
-
-          batch_result_aggregate = ResultAggregate.new
+          # XACK/SADD, result-list writes, statistics and expiries are committed
+          # atomically so a diagnostic probe cannot observe a valid half-commit.
+          runnable_results = commit_results(results)
           runnable_results.each do |runnable_result|
             # Complete the reporter contract by calling `record` with the result.
             reporter.record(runnable_result.committed_result)
 
-            # Update statistics.
-            batch_result_aggregate.update_with_result(runnable_result)
+            # The combined statistics were updated by `commit_results`; only this
+            # worker's local statistics remain to be recorded here.
             local_results.update_with_result(runnable_result)
-
-            case (result_type = ResultType.of(runnable_result.committed_result))
-            when ResultType::Skipped, ResultType::Failed, ResultType::Error
-              redis.lpush(list_key(result_type.serialize), runnable_result.enqueued_runnable.identifier)
-            when ResultType::Passed, ResultType::Requeued, ResultType::Discarded
-              # noop
-            else
-              T.absurd(result_type)
-            end
           end
-
-          adjust_combined_results(batch_result_aggregate)
         end
 
         sig { returns(T.nilable(Logger)) }
@@ -556,6 +901,11 @@ module Minitest
         def next_backoff(backoff)
           [backoff << 1, MAX_BACKOFF].min
         end
+
+        # Confirm a drained mismatch because the diagnostic probe itself uses
+        # multiple pipelined Redis commands and is not an atomic snapshot.
+        STALL_CONFIRMATION_SECONDS = 30.0
+        private_constant :STALL_CONFIRMATION_SECONDS
 
         INITIAL_BACKOFF = 10 # milliseconds
         private_constant :INITIAL_BACKOFF

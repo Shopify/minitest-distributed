@@ -361,7 +361,7 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
       log = File.read(T.must(f.path))
       assert_includes(log, "xpending")
       assert_includes(log, "mget")
-      assert_includes(log, "xack")
+      assert_includes(log, "evalsha")
     end
   end
 end

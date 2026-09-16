@@ -62,6 +62,8 @@ module Minitest
             remaining_idle_iterations <= 0
           end
           fake_results.define_singleton_method(:abort?) { false }
+          fake_results.define_singleton_method(:acks) { 0 }
+          fake_results.define_singleton_method(:size) { 1 }
           @coordinator.define_singleton_method(:combined_results) { fake_results }
 
           @coordinator.consume(reporter: Minitest::CompositeReporter.new)

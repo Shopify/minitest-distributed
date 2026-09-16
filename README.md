@@ -81,6 +81,18 @@ them to fail.
 - `--worker-id=IDENTIFIER` or `ENV[MINITEST_WORKER_ID]`: The ID of the worker,
   which should be unique to the cluster. We will default to a UUID if this is
   not set, which generally is fine.
+- `--key-ttl=SECONDS` or `ENV[MINITEST_KEY_TTL_SECONDS]` (default: 86400, i.e.
+  24 hours). The expiry applied to every Redis key a run owns, refreshed on
+  every write. A run's statistics deliberately outlive the run itself so retry
+  mode can read them, and this is what eventually reclaims them. Raise it if you
+  retry runs more than a day later; do not set it below the duration of a run,
+  because a key expiring mid-run would stall the workers.
+- `--stall-timeout=SECONDS` or `ENV[MINITEST_STALL_TIMEOUT_SECONDS]` (default:
+  300, i.e. 5 minutes). After this long without processing a batch or observing
+  the run counters change, inspect the Redis stream. If it has no pending or
+  undelivered tests but `acks` does not equal `size`, abort with a diagnostic
+  instead of waiting silently forever. Keep this comfortably above the normal
+  end-of-run wait for your suite.
 - `--exclude-file=PATH_TO_FILE`: Specify a file of tests to be excluded
   from running. The file should include test identifiers seperated by
   newlines.

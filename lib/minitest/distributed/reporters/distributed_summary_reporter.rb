@@ -25,8 +25,10 @@ module Minitest
           print_discard_warning if local_results.discards > 0
 
           if configuration.coordinator.aborted?
-            io.puts("Cannot retry a run that was cut short during the previous attempt.")
-            io.puts
+            unless coordinator_stalled?
+              io.puts("Cannot retry a run that was cut short during the previous attempt.")
+              io.puts
+            end
           elsif combined_results.abort?
             io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
             io.puts
@@ -63,6 +65,12 @@ module Minitest
             take too long to run. Make sure that all your tests complete well within #{configuration.test_timeout_seconds}s.
 
           WARNING
+        end
+
+        sig { returns(T::Boolean) }
+        def coordinator_stalled?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:stalled?) && !!coordinator.stalled?
         end
 
         sig { returns(ResultAggregate) }
