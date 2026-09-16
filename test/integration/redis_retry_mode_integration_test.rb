@@ -87,6 +87,25 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(0, results.requeues)
   end
 
+  def test_retry_with_invalid_failure_list_type_runs_the_full_suite
+    run_id = "test_retry_with_invalid_failure_list_type_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    @redis.del("minitest/#{run_id}/failed_list")
+    @redis.set("minitest/#{run_id}/failed_list", "not-a-list")
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.runs)
+    assert_equal(1, results.failures)
+    assert_equal(0, results.requeues)
+  end
+
   def test_retry_failed_build_with_consistently_failing_test
     worker1 = spawn_redis_worker(
       test_file: "failing_tests.rb",
@@ -245,6 +264,27 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     # So we end up 50*2 + 50 when starting the retry run +
     # 50*2 for the second attempt = 250 requeues in total.
     assert_equal(250, results.requeues)
+  end
+
+  def test_concurrent_workers_join_truncated_retry_generation
+    run_id = "test_concurrent_workers_join_truncated_retry_generation"
+    worker1 = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--no-retry-failures" => "true", "--max-failures" => "10" },
+    ).value
+    refute_worker_successful(worker1)
+
+    workers = spawn_redis_workers(
+      count: 3,
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--retry-failures" => "true", "--max-failures" => "10" },
+    ).map(&:value)
+
+    assert_some_workers_failed(workers)
+    refute_includes(workers_output(workers), "STALEATTEMPT")
+    refute_includes(workers_output(workers), "COORDINATORSTREAM")
   end
 
   def test_new_max_failures_does_not_reclassify_a_completed_run_as_truncated

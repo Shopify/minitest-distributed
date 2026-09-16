@@ -202,6 +202,55 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     T.unsafe(new_coordinator).send(:cleanup) if new_coordinator
   end
 
+  def test_missing_generation_aborts_locally_without_deleting_shared_stream
+    run_id = "test_missing_generation_aborts_locally_without_deleting_shared_stream"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+    @redis.del("minitest/#{run_id}/attempt_generation")
+
+    capture_io do
+      T.unsafe(coordinator).send(:abort_with_diagnostic, "generation missing")
+    end
+
+    assert_predicate(coordinator, :aborted?)
+    assert_equal("generation missing", coordinator.stall_diagnostic)
+    assert(@redis.exists?("minitest/#{run_id}/queue"), "unowned abort deleted the shared stream")
+    refute(@redis.exists?("minitest/#{run_id}/stalled"))
+  end
+
+  def test_missing_generation_fails_closed_when_truncation_cannot_be_persisted
+    run_id = "test_missing_generation_fails_closed_when_truncation_cannot_be_persisted"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+    @redis.del("minitest/#{run_id}/attempt_generation")
+
+    capture_io do
+      T.unsafe(coordinator).send(:mark_run_truncated)
+    end
+
+    assert_predicate(coordinator, :aborted?)
+    assert_includes(T.must(coordinator.stall_diagnostic), "could not persist max-failures truncation state")
+    refute(@redis.exists?("minitest/#{run_id}/truncated"))
+  end
+
+  def test_invalid_statistic_emits_diagnostic_before_aborting
+    run_id = "test_invalid_statistic_emits_diagnostic_before_aborting"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+    @redis.set("minitest/#{run_id}/acks", "not-an-integer")
+    T.unsafe(coordinator).instance_variable_set(:@combined_results, nil)
+
+    capture_io do
+      coordinator.consume(reporter: Minitest::CompositeReporter.new)
+    end
+
+    assert_predicate(coordinator, :aborted?)
+    assert_includes(T.must(coordinator.stall_diagnostic), "could not parse Redis coordinator state")
+  end
+
   def test_pending_tests_warn_but_do_not_abort
     workers = spawn_redis_workers(
       count: 2,

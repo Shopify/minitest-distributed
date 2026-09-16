@@ -51,6 +51,7 @@ module Minitest
           const :lag, T.nilable(Integer)
           const :production_complete, T::Boolean
           const :production_heartbeat, T.nilable(Integer)
+          const :invalid_values, T::Array[String]
         end
         private_constant :StallProbe
 
@@ -169,24 +170,35 @@ module Minitest
           registration_keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           registration_keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
           registration_keys.push(key("truncated"), key("completed_at"))
-          registration = T.unsafe(execute_script(
-            script_name: :register_consumergroup,
-            keys: registration_keys,
-            argv: [
-              BASE_GROUP_NAME,
-              configuration.key_ttl_seconds,
-              configuration.max_failures || "",
-              SecureRandom.uuid,
-              COMPLETED_ATTEMPT_GRACE_SECONDS,
-            ],
-          ))
+          registration = T.let(nil, T.untyped)
+          registration_mode = T.let(-1, Integer)
+          leader = T.let(false, T::Boolean)
+          ignore_completion_grace = T.let(false, T::Boolean)
+          loop do
+            registration = T.unsafe(execute_script(
+              script_name: :register_consumergroup,
+              keys: registration_keys,
+              argv: [
+                BASE_GROUP_NAME,
+                configuration.key_ttl_seconds,
+                configuration.max_failures || "",
+                SecureRandom.uuid,
+                COMPLETED_ATTEMPT_GRACE_SECONDS,
+                ignore_completion_grace ? 1 : 0,
+              ],
+            ))
 
-          leader = registration.fetch(0) == 1
-          @attempt_generation = String(registration.fetch(1))
-          @group_name = "#{BASE_GROUP_NAME}-#{@attempt_generation}"
+            leader = registration.fetch(0) == 1
+            @attempt_generation = String(registration.fetch(1))
+            @group_name = "#{BASE_GROUP_NAME}-#{@attempt_generation}"
+            registration_mode = Integer(registration.fetch(2))
+            break unless registration_mode == -2
+
+            sleep(Float(registration.fetch(5)))
+            ignore_completion_grace = true
+          end
           return unless leader
 
-          registration_mode = Integer(registration.fetch(2))
           previous_failures = T.cast(registration.fetch(3), T::Array[String])
           previous_errors = T.cast(registration.fetch(4), T::Array[String])
           production_heartbeat_thread = start_production_heartbeat
@@ -307,6 +319,15 @@ module Minitest
                 probe = probe_stall
                 @combined_results = nil
 
+                if probe.invalid_values.any?
+                  abort_with_diagnostic(<<~DIAGNOSTIC)
+                    ERROR: minitest-distributed found invalid numeric Redis coordinator state.
+                    #{format_probe_state(probe)}
+                    Invalid values: #{probe.invalid_values.join(", ")}
+                  DIAGNOSTIC
+                  break
+                end
+
                 # Another worker may have completed the run while our memoized aggregate
                 # was stale. Treat the fresh counters as authoritative.
                 if probe.production_complete && !probe.acks.nil? && probe.acks == probe.size
@@ -401,6 +422,13 @@ module Minitest
           else
             raise
           end
+        rescue ArgumentError, TypeError => parse_error
+          abort_with_diagnostic(<<~DIAGNOSTIC)
+            ERROR: minitest-distributed could not parse Redis coordinator state.
+            run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+            parse_error=#{parse_error.message.inspect}
+          DIAGNOSTIC
+          cleanup if stalled?
         ensure
           # Another worker may commit the final batch and clean up while this
           # worker is unwinding from NOGROUP. Report and validate against one
@@ -456,7 +484,7 @@ module Minitest
             -- production-complete 0/0 or fully-acked stream is terminal even if
             -- its last worker died before cleanup; let the normal retry snapshot
             -- path take ownership instead of joining it as an empty follower.
-            if stream_exists and current_generation and not stalled and not truncated then
+            if stream_exists and current_generation and not stalled then
               local completed = false
               local invalid_terminal_counters = false
               if existing_stat_count == 10 and redis.call('EXISTS', KEYS[4]) == 1 then
@@ -532,12 +560,19 @@ module Minitest
                   if redis.call('EXISTS', KEYS[4]) == 0 then
                     mode = 2
                   else
-                    previous_failures = redis.call('LRANGE', KEYS[18], 0, -1)
-                    previous_errors = redis.call('LRANGE', KEYS[19], 0, -1)
-                    if #previous_failures ~= failures or #previous_errors ~= errors then
+                    local failed_list_type = redis.call('TYPE', KEYS[18]).ok
+                    local error_list_type = redis.call('TYPE', KEYS[19]).ok
+                    if (failed_list_type ~= 'none' and failed_list_type ~= 'list') or
+                      (error_list_type ~= 'none' and error_list_type ~= 'list') then
                       mode = 2
                     else
-                      mode = 1 -- valid selective retry
+                      previous_failures = redis.call('LRANGE', KEYS[18], 0, -1)
+                      previous_errors = redis.call('LRANGE', KEYS[19], 0, -1)
+                      if #previous_failures ~= failures or #previous_errors ~= errors then
+                        mode = 2
+                      else
+                        mode = 1 -- valid selective retry
+                      end
                     end
                   end
                 elseif max_failures and failures + errors >= max_failures then
@@ -560,6 +595,28 @@ module Minitest
               end
             end
 
+            -- Cleanup normally removes the stream before late cohort workers
+            -- finish starting. Honor the same completion grace without a stream;
+            -- the caller waits and registers again instead of resetting counters.
+            if mode == 1 and not stream_exists and current_generation and ARGV[6] ~= '1' then
+              local completed_at = nil
+              if redis.call('TYPE', KEYS[21]).ok == 'string' then
+                completed_at = tonumber(redis.call('GET', KEYS[21]))
+              end
+              if completed_at then
+                local redis_time = redis.call('TIME')
+                local now = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
+                local grace = tonumber(ARGV[5])
+                local remaining_grace = grace - (now - completed_at)
+                if remaining_grace > grace then
+                  remaining_grace = grace
+                end
+                if remaining_grace > 0 then
+                  return {0, current_generation, -2, {}, {}, remaining_grace}
+                end
+              end
+            end
+
             -- No active attempt reaches here. A random token never repeats after
             -- expiry/eviction, so old workers cannot regain authority over a new
             -- attempt. All destructive changes and group creation are atomic.
@@ -573,8 +630,8 @@ module Minitest
             else
               redis.call('DEL', KEYS[4], KEYS[5], KEYS[21])
               if mode == 1 or mode == 3 then
-                redis.call('SET', KEYS[15], 0)
-                redis.call('SET', KEYS[16], 0)
+                redis.call('SET', KEYS[15], 0, 'EX', ARGV[2])
+                redis.call('SET', KEYS[16], 0, 'EX', ARGV[2])
               else
                 redis.call('DEL', KEYS[15], KEYS[16])
               end
@@ -915,11 +972,11 @@ module Minitest
         def abort_script
           @abort_script ||= redis.script(:load, <<~LUA)
             local current_generation = redis.call('GET', KEYS[2])
-            if current_generation and current_generation ~= ARGV[1] then
+            if not current_generation or current_generation ~= ARGV[1] then
               return 0
             end
 
-            redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+            redis.call('EXPIRE', KEYS[2], ARGV[3])
             redis.call('SET', KEYS[3], 1, 'EX', ARGV[3])
             redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
             redis.call('DEL', KEYS[1])
@@ -1142,11 +1199,18 @@ module Minitest
         sig { void }
         def mark_run_truncated
           generation = T.must(@attempt_generation)
-          execute_script(
+          applied = execute_script(
             script_name: :mark_attempt_state,
             keys: [key("attempt_generation"), key("truncated")],
             argv: [generation, configuration.key_ttl_seconds],
           )
+          return if applied == 1 || attempt_superseded?
+
+          abort_with_diagnostic(<<~DIAGNOSTIC)
+            ERROR: minitest-distributed could not persist max-failures truncation state.
+            run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+            The attempt generation key may have expired, been evicted, or been deleted.
+          DIAGNOSTIC
         end
 
         sig { returns(Thread) }
@@ -1185,8 +1249,7 @@ module Minitest
 
         sig { returns(T.nilable(Integer)) }
         def current_production_heartbeat
-          value = redis.get(key("production_heartbeat"))
-          value.nil? ? nil : Integer(value)
+          parse_redis_integer(redis.get(key("production_heartbeat")))
         end
 
         # Read all the state needed to distinguish a legitimately slow pending
@@ -1204,7 +1267,17 @@ module Minitest
           raw_acks, raw_size, raw_production_complete, raw_production_heartbeat = T.unsafe(counters)
           group = T.unsafe(groups).find { |candidate| candidate.fetch("name") == group_name }
           raw_lag = group&.fetch("lag", nil)
-          lag = raw_lag.nil? ? nil : Integer(raw_lag)
+          invalid_values = T.let([], T::Array[String])
+          acks = parse_redis_integer(raw_acks)
+          size = parse_redis_integer(raw_size)
+          lag = parse_redis_integer(raw_lag)
+          production_heartbeat = parse_redis_integer(raw_production_heartbeat)
+          invalid_values << "acks=#{raw_acks.inspect}" if !raw_acks.nil? && acks.nil?
+          invalid_values << "size=#{raw_size.inspect}" if !raw_size.nil? && size.nil?
+          invalid_values << "lag=#{raw_lag.inspect}" if !raw_lag.nil? && lag.nil?
+          if !raw_production_heartbeat.nil? && production_heartbeat.nil?
+            invalid_values << "production_heartbeat=#{raw_production_heartbeat.inspect}"
+          end
 
           # Redis added the explicit group lag field in version 7. On older
           # versions, equal delivery and stream IDs still prove that there are no
@@ -1213,13 +1286,18 @@ module Minitest
             lag = 0
           end
 
+          raw_pending_count = T.unsafe(pending_summary).fetch("size")
+          pending_count = parse_redis_integer(raw_pending_count)
+          invalid_values << "pending=#{raw_pending_count.inspect}" if pending_count.nil?
+
           StallProbe.new(
-            acks: raw_acks.nil? ? nil : Integer(raw_acks),
-            size: raw_size.nil? ? nil : Integer(raw_size),
-            pending_count: Integer(T.unsafe(pending_summary).fetch("size")),
+            acks: acks,
+            size: size,
+            pending_count: pending_count || 0,
             lag: lag,
             production_complete: !raw_production_complete.nil?,
-            production_heartbeat: raw_production_heartbeat.nil? ? nil : Integer(raw_production_heartbeat),
+            production_heartbeat: production_heartbeat,
+            invalid_values: invalid_values,
           )
         end
 
@@ -1233,7 +1311,16 @@ module Minitest
           return if attempt_superseded?
 
           @combined_results = nil
-          results = combined_results
+          begin
+            results = combined_results
+          rescue ArgumentError, TypeError => parse_error
+            abort_with_diagnostic(<<~DIAGNOSTIC)
+              ERROR: minitest-distributed could not parse Redis coordinator statistics.
+              run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+              redis_error=#{error.message.inspect} parse_error=#{parse_error.message.inspect}
+            DIAGNOSTIC
+            return
+          end
           mandatory_state_missing = error.message.start_with?("COORDINATORSTATE")
           return if !mandatory_state_missing && (run_complete?(results) || results.abort?)
 
@@ -1266,8 +1353,11 @@ module Minitest
             keys: [stream_key, key("attempt_generation"), key("stalled")],
             argv: [generation, group_name, configuration.key_ttl_seconds],
           )
-          return unless applied == 1
+          return if applied != 1 && attempt_superseded?
 
+          # If ownership evidence itself was evicted, do not mutate shared state,
+          # but still fail this worker with the diagnostic rather than silently
+          # continuing or reporting success.
           @aborted = true
           @stall_diagnostic = diagnostic
           emit_message(diagnostic)
@@ -1301,6 +1391,14 @@ module Minitest
             "pending=#{probe.pending_count} lag=#{format_probe_value(probe.lag)} " \
             "production_complete=#{probe.production_complete} " \
             "production_heartbeat=#{format_probe_value(probe.production_heartbeat)}"
+        end
+
+        sig { params(value: T.untyped).returns(T.nilable(Integer)) }
+        def parse_redis_integer(value)
+          case value
+          when Integer then value
+          when String then value.match?(/\A-?\d+\z/) ? value.to_i : nil
+          end
         end
 
         sig { params(value: T.nilable(Integer)).returns(String) }
@@ -1539,7 +1637,7 @@ module Minitest
         MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS = 30.0
         private_constant :MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS
 
-        COMPLETED_ATTEMPT_GRACE_SECONDS = 30.0
+        COMPLETED_ATTEMPT_GRACE_SECONDS = 1.0
         private_constant :COMPLETED_ATTEMPT_GRACE_SECONDS
 
         PRODUCTION_BATCH_SIZE = 100
