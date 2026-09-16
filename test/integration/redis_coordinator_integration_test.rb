@@ -41,6 +41,19 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     assert_equal(0, results.skips)
   end
 
+  def test_no_tests_with_multiple_workers_waits_for_production
+    workers = spawn_redis_workers(
+      count: 3,
+      test_file: "no_tests.rb",
+      run_id: "test_no_tests_with_multiple_workers_waits_for_production",
+    ).map(&:value)
+
+    assert_all_workers_successful(workers)
+    results = combined_results(run_id: "test_no_tests_with_multiple_workers_waits_for_production")
+    assert_predicate(results, :complete?)
+    assert_equal(0, results.size)
+  end
+
   def test_passing_tests_with_one_worker
     runner = spawn_redis_worker(
       test_file: "passing_tests.rb",

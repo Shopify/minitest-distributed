@@ -13,7 +13,7 @@ module Minitest
 
       # Expiry applied to every Redis key the coordinator writes, refreshed on
       # every write, so a finished run's bookkeeping does not live in the
-      # coordinator forever. See `RedisCoordinator#refresh_key_ttls`.
+      # coordinator forever.
       DEFAULT_KEY_TTL_SECONDS = 86_400 # 24 hours
       DEFAULT_STALL_TIMEOUT_SECONDS = 300.0 # 5 minutes
 

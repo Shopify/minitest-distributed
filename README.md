@@ -85,14 +85,17 @@ them to fail.
   24 hours). The expiry applied to every Redis key a run owns, refreshed on
   every write. A run's statistics deliberately outlive the run itself so retry
   mode can read them, and this is what eventually reclaims them. Raise it if you
-  retry runs more than a day later; do not set it below the duration of a run,
-  because a key expiring mid-run would stall the workers.
+  retry runs more than a day later. Once these keys expire, a later invocation
+  with the same run ID performs a full run rather than a selective retry. Do not
+  set it below the duration of a run: required state expiring mid-run aborts the
+  run to avoid reporting incomplete results.
 - `--stall-timeout=SECONDS` or `ENV[MINITEST_STALL_TIMEOUT_SECONDS]` (default:
   300, i.e. 5 minutes). After this long without processing a batch or observing
   the run counters change, inspect the Redis stream. If it has no pending or
   undelivered tests but `acks` does not equal `size`, abort with a diagnostic
-  instead of waiting silently forever. Keep this comfortably above the normal
-  end-of-run wait for your suite.
+  instead of waiting silently forever. A producer heartbeat keeps slow test
+  discovery from being mistaken for a stall. Keep this comfortably above the
+  normal end-of-run wait for your suite.
 - `--exclude-file=PATH_TO_FILE`: Specify a file of tests to be excluded
   from running. The file should include test identifiers seperated by
   newlines.

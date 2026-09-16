@@ -50,6 +50,7 @@ module Minitest
           const :pending_count, Integer
           const :lag, T.nilable(Integer)
           const :production_complete, T::Boolean
+          const :production_heartbeat, T.nilable(Integer)
         end
         private_constant :StallProbe
 
@@ -79,8 +80,18 @@ module Minitest
           @configuration = configuration
 
           @redis = T.let(nil, T.nilable(Redis))
+          @register_consumergroup_script = T.let(nil, T.nilable(String))
+          @commit_results_script = T.let(nil, T.nilable(String))
+          @cleanup_script = T.let(nil, T.nilable(String))
+          @abort_script = T.let(nil, T.nilable(String))
+          @adjust_results_script = T.let(nil, T.nilable(String))
+          @publish_tests_script = T.let(nil, T.nilable(String))
+          @heartbeat_script = T.let(nil, T.nilable(String))
+          @mark_attempt_state_script = T.let(nil, T.nilable(String))
           @stream_key = T.let(key("queue"), String)
-          @group_name = T.let("minitest-distributed", String)
+          @group_name = T.let(BASE_GROUP_NAME, String)
+          @attempt_generation = T.let(nil, T.nilable(String))
+          @production_complete = T.let(false, T::Boolean)
           @local_results = T.let(ResultAggregate.new, ResultAggregate)
           @combined_results = T.let(nil, T.nilable(ResultAggregate))
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
@@ -145,106 +156,92 @@ module Minitest
 
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
-          # Whoever ends up creating the consumer group will act as leader,
-          # and publish the list of tests to the stream.
-          consumer_group_exists = false
-          initial_attempt = begin
-            # When using `redis.multi`, the second DEL command gets executed even if the initial GROUP
-            # fails. This is bad, because only the leader should be issuing the DEL command.
-            # When using EVAL and a Lua script, the script aborts after the first XGROUP command
-            # fails, and the DEL never gets executed for followers.
-            keys_deleted = redis.evalsha(
-              register_consumergroup_script,
-              keys: [stream_key, key("size"), key("acks"), key("production_complete")],
-              argv: [group_name, configuration.key_ttl_seconds],
-            )
-            keys_deleted == 0
-          rescue Redis::CommandError => ce
-            if ce.message.include?("BUSYGROUP")
-              # If Redis returns a BUSYGROUP error, it means that the consumer group already
-              # exists. In our case, it means that another worker managed to successfully
-              # run the XGROUP command, and will act as leader and publish the tests.
-              # This worker can simply move on the consumer mode.
-              consumer_group_exists = true
-            else
-              raise
-            end
-          end
+          production_heartbeat_thread = T.let(nil, T.nilable(Thread))
 
-          return if consumer_group_exists
+          registration_keys = [
+            stream_key,
+            key("attempt_generation"),
+            key("stalled"),
+            key("production_complete"),
+            key("production_heartbeat"),
+            key("retry_set"),
+          ]
+          registration_keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
+          registration_keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
+          registration_keys << key("truncated")
+          registration = T.unsafe(execute_script(
+            script_name: :register_consumergroup,
+            keys: registration_keys,
+            argv: [
+              BASE_GROUP_NAME,
+              configuration.key_ttl_seconds,
+              configuration.max_failures || "",
+              SecureRandom.uuid,
+            ],
+          ))
+
+          leader = registration.fetch(0) == 1
+          @attempt_generation = String(registration.fetch(1))
+          @group_name = "#{BASE_GROUP_NAME}-#{@attempt_generation}"
+          return unless leader
+
+          registration_mode = Integer(registration.fetch(2))
+          previous_failures = T.cast(registration.fetch(3), T::Array[String])
+          previous_errors = T.cast(registration.fetch(4), T::Array[String])
+          production_heartbeat_thread = start_production_heartbeat
 
           tests = T.let(
-            if redis.exists?(key("stalled"))
-              # A previous attempt lost coordinator state, so its failure lists and
-              # statistics cannot be trusted as the basis for a selective retry.
+            case registration_mode
+            when 0 # First attempt for a new run ID.
+              tests_from_selector = test_selector.tests
+              adjust_combined_results(
+                ResultAggregate.new(size: tests_from_selector.size),
+                allow_missing_stats: true,
+              )
+              tests_from_selector
+            when 1 # Valid completed attempt; use selective retry behavior.
+              if configuration.retry_failures
+                total_failures = previous_failures.length + previous_errors.length
+                adjust_combined_results(
+                  ResultAggregate.new(
+                    size: total_failures,
+                    failures: -previous_failures.length,
+                    errors: -previous_errors.length,
+                    requeues: total_failures,
+                  ),
+                  clear_retry_lists: true,
+                )
+
+                test_identifiers_to_retry = T.let(previous_failures + previous_errors, T::Array[String])
+                test_identifiers_to_retry.map { |identifier| DefinedRunnable.from_identifier(identifier) }
+              else
+                adjust_combined_results(ResultAggregate.new(size: 0))
+                []
+              end
+            when 2 # Inconsistent or explicitly stalled state; rerun everything.
+              emit_message(<<~WARNING)
+                WARNING: The previous attempt lost Redis coordinator state.
+                Running the full test suite instead of a selective retry.
+              WARNING
+              tests_from_selector = test_selector.tests
+              adjust_combined_results(
+                ResultAggregate.new(size: tests_from_selector.size),
+                allow_missing_stats: true,
+              )
+              tests_from_selector
+            when 3 # The previous attempt intentionally stopped at max_failures.
               @aborted = true
               adjust_combined_results(ResultAggregate.new(size: 0))
               []
-            elsif initial_attempt
-              # If this is the first attempt for this run ID, we will schedule the full
-              # test suite as returned by the test selector to run.
-
-              tests_from_selector = test_selector.tests
-              adjust_combined_results(ResultAggregate.new(size: tests_from_selector.size))
-              tests_from_selector
-
-            elsif configuration.retry_failures
-              # Before starting a retry attempt, we first check if the previous attempt
-              # was aborted before it was completed. If this is the case, we cannot use
-              # retry mode, and should immediately fail the attempt.
-              if combined_results.abort?
-                # We mark this run as aborted, which causes this worker to not be successful.
-                @aborted = true
-
-                # We still publish an empty size run to Redis, so if there are any followers,
-                # they will wind down normally. Only the leader will exit
-                # with a non-zero exit status and fail the build; any follower will
-                # exit with status 0.
-                adjust_combined_results(ResultAggregate.new(size: 0))
-                []
-              else
-                previous_failures, previous_errors, _deleted = redis.multi do |pipeline|
-                  pipeline.lrange(list_key(ResultType::Failed.serialize), 0, -1)
-                  pipeline.lrange(list_key(ResultType::Error.serialize), 0, -1)
-                  pipeline.del(list_key(ResultType::Failed.serialize), list_key(ResultType::Error.serialize))
-                end
-
-                # We set the `size` key to the number of tests we are planning to schedule.
-                # We also adjust the number of failures and errors back to 0.
-                # We set the number of requeues to the number of tests that failed, so the
-                # run statistics will reflect that we retried some failed test.
-                #
-                # However, normally requeues are not acked, as we expect the test to be acked
-                # by another worker later. This makes the test loop think iot is already done.
-                # To prevent this, we initialize the number of acks negatively, so it evens out
-                # in the statistics.
-                total_failures = previous_failures.length + previous_errors.length
-                adjust_combined_results(ResultAggregate.new(
-                  size: total_failures,
-                  failures: -previous_failures.length,
-                  errors: -previous_errors.length,
-                  requeues: total_failures,
-                ))
-
-                # For subsequent attempts, we check the list of previous failures and
-                # errors, and only schedule to re-run those tests. This allows for faster
-                # retries of potentially flaky tests.
-                test_identifiers_to_retry = T.let(previous_failures + previous_errors, T::Array[String])
-                test_identifiers_to_retry.map { |identifier| DefinedRunnable.from_identifier(identifier) }
-              end
             else
-              adjust_combined_results(ResultAggregate.new(size: 0))
-              []
+              raise "Unknown Redis registration mode: #{registration_mode}"
             end,
             T::Array[Minitest::Runnable],
           )
 
-          redis.pipelined do |pipeline|
-            tests.each do |test|
-              pipeline.xadd(stream_key, { class_name: T.must(test.class.name), method_name: test.name })
-            end
-            pipeline.set(key("production_complete"), "1", ex: configuration.key_ttl_seconds)
-          end
+          publish_tests(tests)
+        ensure
+          stop_production_heartbeat(production_heartbeat_thread) if production_heartbeat_thread
         end
 
         sig { override.params(reporter: AbstractReporter).void }
@@ -254,6 +251,7 @@ module Minitest
           initial_results = combined_results
           observed_acks = T.let(initial_results.acks, T.nilable(Integer))
           observed_size = T.let(initial_results.size, T.nilable(Integer))
+          observed_production_heartbeat = current_production_heartbeat
           pending_stall_warning_emitted = T.let(false, T::Boolean)
           drained_mismatch_detected_at = T.let(nil, T.nilable(Float))
           incomplete_production_detected_at = T.let(nil, T.nilable(Float))
@@ -273,11 +271,15 @@ module Minitest
             # is complete and we can exit our loop. Generally, only one worker will detect
             # this condition. The other workers will quit their consumer loop because the
             # consumer group will be deleted by the first worker, and their Redis commands
-            # will start to fail - see the rescue block below.
-            break if run_results.complete?
+            # will start to fail - see the rescue block below. Counters can be 0/0 before
+            # an empty run finishes publishing, so production completion is also required.
+            break if run_complete?(run_results)
 
             # We also abort a run if we reach the maximum number of failures.
-            break if run_results.abort?
+            if run_results.abort?
+              mark_run_truncated
+              break
+            end
 
             processed_batch = stale_runnables.any? || fresh_runnables.any?
             if processed_batch
@@ -303,15 +305,17 @@ module Minitest
 
                 # Another worker may have completed the run while our memoized aggregate
                 # was stale. Treat the fresh counters as authoritative.
-                if !probe.acks.nil? && probe.acks == probe.size
+                if probe.production_complete && !probe.acks.nil? && probe.acks == probe.size
                   break
                 end
 
                 counters_changed = probe.acks != observed_acks || probe.size != observed_size
+                heartbeat_changed = probe.production_heartbeat != observed_production_heartbeat
                 if counters_changed
                   observed_acks = probe.acks
                   observed_size = probe.size
                 end
+                observed_production_heartbeat = probe.production_heartbeat
 
                 stream_empty = probe.pending_count.zero? && probe.lag == 0
                 if probe.production_complete && stream_empty
@@ -327,13 +331,19 @@ module Minitest
                   end
                 elsif !probe.production_complete && stream_empty
                   drained_mismatch_detected_at = nil
-                  if incomplete_production_detected_at && !counters_changed
+                  production_progressed = counters_changed || heartbeat_changed
+                  if incomplete_production_detected_at && !production_progressed
                     abort_stalled_run(probe)
                     break
+                  elsif production_progressed
+                    # A live leader refreshes this heartbeat while it selects and
+                    # publishes tests, so arbitrarily slow discovery is not mistaken
+                    # for a dead producer.
+                    incomplete_production_detected_at = nil
+                    last_progress_at = now
                   else
-                    # The leader may still be selecting tests. Give production a
-                    # second full stall interval, but do not wait forever if the
-                    # leader died or this marker was itself evicted.
+                    # No producer heartbeat was observed. Confirm once more after a
+                    # full stall interval before declaring the leader dead.
                     incomplete_production_detected_at = now
                   end
                 else
@@ -373,10 +383,17 @@ module Minitest
 
           cleanup
         rescue Redis::CommandError => ce
-          if ce.message.start_with?("NOGROUP") || ce.message.include?("no such key")
-            # A normal cleanup and an evicted/deleted stream produce the same Redis
+          coordinator_state_error = ce.message.start_with?(
+            "NOGROUP",
+            "COORDINATORSTATE",
+            "COORDINATORSTREAM",
+            "STALEATTEMPT",
+          ) || ce.message.include?("no such key")
+          if coordinator_state_error
+            # A normal cleanup and missing/evicted state can produce similar Redis
             # errors. Fresh counters distinguish a terminal run from data loss.
-            handle_missing_stream_error(ce)
+            handle_coordinator_state_error(ce)
+            cleanup if stalled?
           else
             raise
           end
@@ -409,31 +426,240 @@ module Minitest
 
         sig { returns(String) }
         def register_consumergroup_script
-          @register_consumergroup_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
-            -- Try to create the consumergroup. This will raise an error if the
-            -- consumergroup has already been registered by somebody else, which
-            -- means another worker will be acting as leader.
-            -- In that case, the next Redis DEL call will not be executed.
-            redis.call('XGROUP', 'CREATE', KEYS[1], ARGV[1], '0', 'MKSTREAM')
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
+          @register_consumergroup_script ||= redis.script(:load, <<~LUA)
+            -- KEYS: stream, generation token, stalled, production_complete,
+            -- production_heartbeat, retry_set, ten statistics, the
+            -- skipped/failed/error lists, then truncated.
+            local stream_exists = redis.call('EXISTS', KEYS[1]) == 1
+            local current_generation = redis.call('GET', KEYS[2])
+            local stalled = redis.call('EXISTS', KEYS[3]) == 1
+            local truncated = redis.call('EXISTS', KEYS[20]) == 1
 
-            -- The leader should reset the size, acks and production marker for this
-            -- run attempt. Only size and acks determine whether this is a retry.
-            local attempt_keys_deleted = redis.call('DEL', KEYS[2], KEYS[3])
-            redis.call('DEL', KEYS[4])
-            return attempt_keys_deleted
+            local required_stats = {}
+            for key_index = 7, 16 do
+              required_stats[#required_stats + 1] = KEYS[key_index]
+            end
+            local existing_stat_count = redis.call('EXISTS', unpack(required_stats))
+
+            -- An active attempt has both a stream and a generation token. A
+            -- production-complete 0/0 or fully-acked stream is terminal even if
+            -- its last worker died before cleanup; let the normal retry snapshot
+            -- path take ownership instead of joining it as an empty follower.
+            if stream_exists and current_generation and not stalled and not truncated then
+              local completed = false
+              local invalid_terminal_counters = false
+              if existing_stat_count == 10 and redis.call('EXISTS', KEYS[4]) == 1 then
+                local acks_type = redis.call('TYPE', KEYS[15]).ok
+                local size_type = redis.call('TYPE', KEYS[16]).ok
+                local acks = nil
+                local size = nil
+                if acks_type == 'string' then
+                  acks = tonumber(redis.call('GET', KEYS[15]))
+                end
+                if size_type == 'string' then
+                  size = tonumber(redis.call('GET', KEYS[16]))
+                end
+                invalid_terminal_counters = not acks or not size
+                completed = not invalid_terminal_counters and acks == size
+              end
+
+              if not completed and not invalid_terminal_counters then
+                return {0, current_generation, -1, {}, {}}
+              end
+            end
+
+            local mode = 0 -- new run
+            local previous_failures = {}
+            local previous_errors = {}
+
+            if stalled then
+              mode = 2 -- fail-closed full rerun
+            elseif existing_stat_count == 10 then
+              local stat_values = {}
+              local numeric_stats = true
+              for key_index = 7, 16 do
+                local key_type = redis.call('TYPE', KEYS[key_index]).ok
+                local value = nil
+                if key_type == 'string' then
+                  value = tonumber(redis.call('GET', KEYS[key_index]))
+                end
+                if not value then
+                  numeric_stats = false
+                else
+                  stat_values[#stat_values + 1] = value
+                end
+              end
+
+              if not numeric_stats then
+                mode = 2
+              else
+                local failures = stat_values[4]
+                local errors = stat_values[5]
+                local acks = stat_values[9]
+                local size = stat_values[10]
+                local max_failures = tonumber(ARGV[3])
+
+                if truncated then
+                  mode = 3 -- intentionally aborted at max_failures
+                elseif acks == size then
+                  if redis.call('EXISTS', KEYS[4]) == 0 then
+                    mode = 2
+                  else
+                    previous_failures = redis.call('LRANGE', KEYS[18], 0, -1)
+                    previous_errors = redis.call('LRANGE', KEYS[19], 0, -1)
+                    if #previous_failures ~= failures or #previous_errors ~= errors then
+                      mode = 2
+                    else
+                      mode = 1 -- valid selective retry
+                    end
+                  end
+                elseif max_failures and failures + errors >= max_failures then
+                  mode = 3
+                else
+                  mode = 2
+                end
+              end
+            elseif existing_stat_count > 0 then
+              mode = 2
+            else
+              -- Auxiliary state without statistics is an abandoned/corrupt run,
+              -- not a genuinely new run ID. The generation token is excluded
+              -- because it intentionally survives cleanup until the shared TTL.
+              local auxiliary_count = redis.call(
+                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20]
+              )
+              if auxiliary_count > 0 then
+                mode = 2
+              end
+            end
+
+            -- No active attempt reaches here. A random token never repeats after
+            -- expiry/eviction, so old workers cannot regain authority over a new
+            -- attempt. All destructive changes and group creation are atomic.
+            redis.call('DEL', KEYS[1])
+            if mode == 2 then
+              for key_index = 3, 20 do
+                redis.call('DEL', KEYS[key_index])
+              end
+              previous_failures = {}
+              previous_errors = {}
+            else
+              redis.call('DEL', KEYS[4], KEYS[5])
+              if mode == 1 or mode == 3 then
+                redis.call('SET', KEYS[15], 0)
+                redis.call('SET', KEYS[16], 0)
+              else
+                redis.call('DEL', KEYS[15], KEYS[16])
+              end
+              if mode == 3 then
+                redis.call('SET', KEYS[20], 1, 'EX', ARGV[2])
+              end
+            end
+
+            local generation = ARGV[4]
+            redis.call('SET', KEYS[2], generation, 'EX', ARGV[2])
+            local group_name = ARGV[1] .. '-' .. generation
+            redis.call('XGROUP', 'CREATE', KEYS[1], group_name, '0', 'MKSTREAM')
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            redis.call('SET', KEYS[5], 0, 'EX', ARGV[2])
+            return {1, generation, mode, previous_failures, previous_errors}
           LUA
         end
 
         sig { returns(String) }
         def commit_results_script
-          @commit_results_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
+          @commit_results_script ||= redis.script(:load, <<~LUA)
             local result_count = tonumber(ARGV[3])
-            local argument_index = 4
+            local expected_generation = ARGV[4]
+            local argument_index = 5
             local commit_results = {}
             -- runs, assertions, passes, failures, errors, skips, requeues,
             -- discards, acks, size
             local deltas = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+            -- Every statistics key is created before any stream entries are
+            -- published. Refuse to recreate missing state as zero: doing so can
+            -- make an incomplete run look complete when both acks and size become
+            -- 0. This preflight occurs before any write because Redis does not
+            -- roll back earlier script writes when a later command errors.
+            local current_generation = redis.call('GET', KEYS[19])
+            if not current_generation then
+              return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[19])
+            elseif current_generation ~= expected_generation then
+              return redis.error_reply('STALEATTEMPT expected generation ' .. expected_generation)
+            end
+
+            if redis.call('TYPE', KEYS[1]).ok ~= 'stream' then
+              return redis.error_reply('COORDINATORSTREAM missing or invalid key ' .. KEYS[1])
+            end
+            local groups = redis.pcall('XINFO', 'GROUPS', KEYS[1])
+            local group_exists = false
+            if not groups.err then
+              for _, group in ipairs(groups) do
+                for field_index = 1, #group, 2 do
+                  if group[field_index] == 'name' and group[field_index + 1] == ARGV[1] then
+                    group_exists = true
+                  end
+                end
+              end
+            end
+            if not group_exists then
+              return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[1])
+            end
+
+            local retry_type = redis.call('TYPE', KEYS[2]).ok
+            if retry_type ~= 'none' and retry_type ~= 'set' then
+              return redis.error_reply('COORDINATORSTATE invalid retry set type')
+            end
+            for list_index = 13, 15 do
+              local list_type = redis.call('TYPE', KEYS[list_index]).ok
+              if list_type ~= 'none' and list_type ~= 'list' then
+                return redis.error_reply('COORDINATORSTATE invalid result list type')
+              end
+            end
+
+            local max_safe_integer = 9007199254740991
+            local stat_values = {}
+            for stat_index = 1, 10 do
+              local stat_key = KEYS[stat_index + 2]
+              if redis.call('TYPE', stat_key).ok ~= 'string' then
+                return redis.error_reply('COORDINATORSTATE missing or invalid key ' .. stat_key)
+              end
+              local validation = redis.pcall('INCRBY', stat_key, 0)
+              if type(validation) == 'table' and validation.err then
+                return redis.error_reply('COORDINATORSTATE invalid required key ' .. stat_key)
+              end
+              local value = tonumber(validation)
+              if math.abs(value) > max_safe_integer then
+                return redis.error_reply('COORDINATORSTATE unsafe statistic value ' .. stat_key)
+              end
+              stat_values[stat_index] = value
+            end
+
+            local allowed_result_types = {
+              passed = true, failed = true, error = true, skipped = true,
+              discarded = true, requeued = true
+            }
+            local validation_index = argument_index
+            local assertion_total = 0
+            for _ = 1, result_count do
+              local result_type = ARGV[validation_index + 1]
+              local assertions = tonumber(ARGV[validation_index + 4])
+              if not allowed_result_types[result_type] or not assertions or assertions % 1 ~= 0 then
+                return redis.error_reply('COORDINATORSTATE invalid result payload')
+              end
+              assertion_total = assertion_total + assertions
+              validation_index = validation_index + 5
+            end
+            local maximum_deltas = {
+              result_count, assertion_total, result_count, result_count, result_count,
+              result_count, result_count, result_count, result_count, 0
+            }
+            for stat_index = 1, 10 do
+              if math.abs(stat_values[stat_index]) + math.abs(maximum_deltas[stat_index]) > max_safe_integer then
+                return redis.error_reply('COORDINATORSTATE unsafe statistic delta')
+              end
+            end
 
             for result_index = 1, result_count do
               local entry_id = ARGV[argument_index]
@@ -488,6 +714,216 @@ module Minitest
 
             return reply
           LUA
+        end
+
+        sig { returns(String) }
+        def adjust_results_script
+          @adjust_results_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[1])
+            if not current_generation then
+              return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[1])
+            elseif current_generation ~= ARGV[1] then
+              return redis.error_reply('STALEATTEMPT expected generation ' .. ARGV[1])
+            end
+
+            local stream_type = redis.call('TYPE', KEYS[2]).ok
+            local retry_type = redis.call('TYPE', KEYS[3]).ok
+            if stream_type ~= 'stream' or (retry_type ~= 'none' and retry_type ~= 'set') then
+              return redis.error_reply('COORDINATORSTATE invalid run key type')
+            end
+            for list_index = 18, 20 do
+              local list_type = redis.call('TYPE', KEYS[list_index]).ok
+              if list_type ~= 'none' and list_type ~= 'list' then
+                return redis.error_reply('COORDINATORSTATE invalid result list type')
+              end
+            end
+
+            local max_safe_integer = 9007199254740991
+            for stat_index = 1, 10 do
+              local stat_key = KEYS[stat_index + 7]
+              local stat_type = redis.call('TYPE', stat_key).ok
+              if stat_type ~= 'none' and stat_type ~= 'string' then
+                return redis.error_reply('COORDINATORSTATE invalid required key ' .. stat_key)
+              elseif stat_type == 'none' and ARGV[4] ~= '1' then
+                return redis.error_reply('COORDINATORSTATE missing required key ' .. stat_key)
+              end
+              local current_value = 0
+              if stat_type == 'string' then
+                local validation = redis.pcall('INCRBY', stat_key, 0)
+                if type(validation) == 'table' and validation.err then
+                  return redis.error_reply('COORDINATORSTATE invalid required key ' .. stat_key)
+                end
+                current_value = tonumber(validation)
+              end
+              local delta = tonumber(ARGV[stat_index + 4])
+              if not delta or delta % 1 ~= 0 or math.abs(current_value + delta) > max_safe_integer then
+                return redis.error_reply('COORDINATORSTATE unsafe statistic value ' .. stat_key)
+              end
+            end
+
+            if ARGV[3] == '1' then
+              redis.call('DEL', KEYS[19], KEYS[20])
+            end
+            local reply = {}
+            for stat_index = 1, 10 do
+              reply[stat_index] = redis.call('INCRBY', KEYS[stat_index + 7], ARGV[stat_index + 4])
+            end
+            for key_index = 1, #KEYS do
+              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+            end
+            return reply
+          LUA
+        end
+
+        sig { returns(String) }
+        def publish_tests_script
+          @publish_tests_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[1])
+            if not current_generation then
+              return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[1])
+            elseif current_generation ~= ARGV[1] then
+              return redis.error_reply('STALEATTEMPT expected generation ' .. ARGV[1])
+            elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
+              return redis.error_reply('COORDINATORSTREAM missing or invalid key ' .. KEYS[2])
+            end
+
+            local groups = redis.pcall('XINFO', 'GROUPS', KEYS[2])
+            local group_exists = false
+            if not groups.err then
+              for _, group in ipairs(groups) do
+                for field_index = 1, #group, 2 do
+                  if group[field_index] == 'name' and group[field_index + 1] == ARGV[5] then
+                    group_exists = true
+                  end
+                end
+              end
+            end
+            if not group_exists then
+              return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[5])
+            end
+
+            local test_count = tonumber(ARGV[4])
+            local argument_index = 6
+            for _ = 1, test_count do
+              redis.call(
+                'XADD', KEYS[2], '*',
+                'class_name', ARGV[argument_index],
+                'method_name', ARGV[argument_index + 1]
+              )
+              argument_index = argument_index + 2
+            end
+            if ARGV[3] == '1' then
+              redis.call('SET', KEYS[3], 1, 'EX', ARGV[2])
+            end
+            for key_index = 1, #KEYS do
+              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+            end
+            return test_count
+          LUA
+        end
+
+        sig { returns(String) }
+        def heartbeat_script
+          @heartbeat_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[1])
+            if not current_generation or current_generation ~= ARGV[1] then
+              return 0
+            end
+            redis.call('INCR', KEYS[2])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[2])
+            return 1
+          LUA
+        end
+
+        sig { returns(String) }
+        def mark_attempt_state_script
+          @mark_attempt_state_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[1])
+            if not current_generation or current_generation ~= ARGV[1] then
+              return 0
+            end
+            redis.call('SET', KEYS[2], 1, 'EX', ARGV[2])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            return 1
+          LUA
+        end
+
+        sig { returns(String) }
+        def cleanup_script
+          @cleanup_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[2])
+            if not current_generation or current_generation ~= ARGV[1] then
+              return 0
+            end
+
+            redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
+            redis.call('DEL', KEYS[1])
+            return 1
+          LUA
+        end
+
+        sig { returns(String) }
+        def abort_script
+          @abort_script ||= redis.script(:load, <<~LUA)
+            local current_generation = redis.call('GET', KEYS[2])
+            if current_generation and current_generation ~= ARGV[1] then
+              return 0
+            end
+
+            redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+            redis.call('SET', KEYS[3], 1, 'EX', ARGV[3])
+            redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
+            redis.call('DEL', KEYS[1])
+            return 1
+          LUA
+        end
+
+        sig do
+          params(
+            script_name: Symbol,
+            keys: T::Array[String],
+            argv: T::Array[T.untyped],
+          ).returns(T.untyped)
+        end
+        def execute_script(script_name:, keys:, argv:)
+          attempts = T.let(0, Integer)
+          begin
+            script_sha = case script_name
+            when :register_consumergroup then register_consumergroup_script
+            when :commit_results then commit_results_script
+            when :cleanup then cleanup_script
+            when :abort then abort_script
+            when :adjust_results then adjust_results_script
+            when :publish_tests then publish_tests_script
+            when :heartbeat then heartbeat_script
+            when :mark_attempt_state then mark_attempt_state_script
+            else raise ArgumentError, "Unknown Redis script: #{script_name}"
+            end
+            redis.evalsha(script_sha, keys: keys, argv: argv)
+          rescue Redis::CommandError => error
+            if error.message.start_with?("NOSCRIPT") && attempts.zero?
+              attempts += 1
+              clear_script_cache(script_name)
+              retry
+            end
+            raise
+          end
+        end
+
+        sig { params(script_name: Symbol).void }
+        def clear_script_cache(script_name)
+          case script_name
+          when :register_consumergroup then @register_consumergroup_script = nil
+          when :commit_results then @commit_results_script = nil
+          when :cleanup then @cleanup_script = nil
+          when :abort then @abort_script = nil
+          when :adjust_results then @adjust_results_script = nil
+          when :publish_tests then @publish_tests_script = nil
+          when :heartbeat then @heartbeat_script = nil
+          when :mark_attempt_state then @mark_attempt_state_script = nil
+          else raise ArgumentError, "Unknown Redis script: #{script_name}"
+          end
         end
 
         sig { params(block: Integer).returns(T::Array[EnqueuedRunnable]) }
@@ -621,19 +1057,98 @@ module Minitest
           enqueued_runnables
         end
 
+        sig { params(tests: T::Array[Minitest::Runnable]).void }
+        def publish_tests(tests)
+          generation = T.must(@attempt_generation)
+          batches = tests.each_slice(PRODUCTION_BATCH_SIZE)
+          batches = [[]].each if tests.empty?
+          batches.each_with_index do |batch, index|
+            final_batch = tests.empty? || (index + 1) * PRODUCTION_BATCH_SIZE >= tests.length
+            argv = T.let(
+              [generation, configuration.key_ttl_seconds, final_batch ? 1 : 0, batch.length, group_name],
+              T::Array[T.untyped],
+            )
+            batch.each do |test|
+              argv << T.must(test.class.name)
+              argv << test.name
+            end
+            execute_script(
+              script_name: :publish_tests,
+              keys: [
+                key("attempt_generation"),
+                stream_key,
+                key("production_complete"),
+                key("production_heartbeat"),
+              ],
+              argv: argv,
+            )
+          end
+          @production_complete = true
+        end
+
+        sig { void }
+        def mark_run_truncated
+          generation = T.must(@attempt_generation)
+          execute_script(
+            script_name: :mark_attempt_state,
+            keys: [key("attempt_generation"), key("truncated")],
+            argv: [generation, configuration.key_ttl_seconds],
+          )
+        end
+
+        sig { returns(Thread) }
+        def start_production_heartbeat
+          generation = T.must(@attempt_generation)
+          interval = [configuration.stall_timeout_seconds / 2, MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS].min
+          Thread.new do
+            Thread.current.report_on_exception = false
+            loop do
+              sleep(interval)
+              updated = execute_script(
+                script_name: :heartbeat,
+                keys: [key("attempt_generation"), key("production_heartbeat")],
+                argv: [generation, configuration.key_ttl_seconds],
+              )
+              break unless updated == 1
+            end
+          end
+        end
+
+        sig { params(thread: Thread).void }
+        def stop_production_heartbeat(thread)
+          thread.kill
+          thread.join
+        end
+
+        sig { params(results: ResultAggregate).returns(T::Boolean) }
+        def run_complete?(results)
+          results.complete? && production_complete?
+        end
+
+        sig { returns(T::Boolean) }
+        def production_complete?
+          @production_complete ||= redis.exists?(key("production_complete"))
+        end
+
+        sig { returns(T.nilable(Integer)) }
+        def current_production_heartbeat
+          value = redis.get(key("production_heartbeat"))
+          value.nil? ? nil : Integer(value)
+        end
+
         # Read all the state needed to distinguish a legitimately slow pending
         # test from a drained queue whose completion counters can no longer agree.
         # This deliberately bypasses `@combined_results`, which is memoized.
         sig { returns(StallProbe) }
         def probe_stall
           counters, pending_summary, groups, stream_info = redis.pipelined do |pipeline|
-            pipeline.mget(key("acks"), key("size"), key("production_complete"))
+            pipeline.mget(key("acks"), key("size"), key("production_complete"), key("production_heartbeat"))
             pipeline.xpending(stream_key, group_name)
             pipeline.xinfo("groups", stream_key)
             pipeline.xinfo("stream", stream_key)
           end
 
-          raw_acks, raw_size, raw_production_complete = T.unsafe(counters)
+          raw_acks, raw_size, raw_production_complete, raw_production_heartbeat = T.unsafe(counters)
           group = T.unsafe(groups).find { |candidate| candidate.fetch("name") == group_name }
           raw_lag = group&.fetch("lag", nil)
           lag = raw_lag.nil? ? nil : Integer(raw_lag)
@@ -651,6 +1166,7 @@ module Minitest
             pending_count: Integer(T.unsafe(pending_summary).fetch("size")),
             lag: lag,
             production_complete: !raw_production_complete.nil?,
+            production_heartbeat: raw_production_heartbeat.nil? ? nil : Integer(raw_production_heartbeat),
           )
         end
 
@@ -660,24 +1176,45 @@ module Minitest
         end
 
         sig { params(error: Redis::CommandError).void }
-        def handle_missing_stream_error(error)
+        def handle_coordinator_state_error(error)
+          return if attempt_superseded?
+
           @combined_results = nil
           results = combined_results
-          return if results.complete? || results.abort?
+          mandatory_state_missing = error.message.start_with?("COORDINATORSTATE")
+          return if !mandatory_state_missing && (run_complete?(results) || results.abort?)
 
           state = "run_id=#{configuration.run_id} worker_id=#{configuration.worker_id} " \
             "acks=#{results.acks} size=#{results.size} redis_error=#{error.message.inspect}"
           diagnostic = <<~DIAGNOSTIC
-            ERROR: minitest-distributed lost its Redis stream or consumer group and aborted the run.
+            ERROR: minitest-distributed lost required Redis coordinator state and aborted the run.
             #{state}
-            The run is incomplete, so this was not normal cleanup. The stream may have been evicted or deleted.
+            The run is incomplete, so this was not normal cleanup. A run key may have expired, been evicted, or been deleted.
           DIAGNOSTIC
           abort_with_diagnostic(diagnostic)
         end
 
+        sig { returns(T::Boolean) }
+        def attempt_superseded?
+          attempt_generation = @attempt_generation
+          return false unless attempt_generation
+
+          current_generation = redis.get(key("attempt_generation"))
+          return false if current_generation.nil?
+
+          current_generation != attempt_generation
+        end
+
         sig { params(diagnostic: String).void }
         def abort_with_diagnostic(diagnostic)
-          redis.set(key("stalled"), "1", ex: configuration.key_ttl_seconds)
+          generation = T.must(@attempt_generation)
+          applied = execute_script(
+            script_name: :abort,
+            keys: [stream_key, key("attempt_generation"), key("stalled")],
+            argv: [generation, group_name, configuration.key_ttl_seconds],
+          )
+          return unless applied == 1
+
           @aborted = true
           @stall_diagnostic = diagnostic
           emit_message(diagnostic)
@@ -709,7 +1246,8 @@ module Minitest
           "run_id=#{configuration.run_id} worker_id=#{configuration.worker_id} " \
             "acks=#{format_probe_value(probe.acks)} size=#{format_probe_value(probe.size)} " \
             "pending=#{probe.pending_count} lag=#{format_probe_value(probe.lag)} " \
-            "production_complete=#{probe.production_complete}"
+            "production_complete=#{probe.production_complete} " \
+            "production_heartbeat=#{format_probe_value(probe.production_heartbeat)}"
         end
 
         sig { params(value: T.nilable(Integer)).returns(String) }
@@ -729,11 +1267,12 @@ module Minitest
 
         sig { void }
         def cleanup
-          redis.xgroup(:destroy, stream_key, group_name)
-          redis.del(stream_key)
-        rescue Redis::CommandError
-          # Apparently another consumer already removed the consumer group,
-          # so we can assume that all the Redis cleanup was completed.
+          generation = T.must(@attempt_generation)
+          execute_script(
+            script_name: :cleanup,
+            keys: [stream_key, key("attempt_generation")],
+            argv: [generation, group_name],
+          )
         end
 
         # The keys the coordinator writes for a run, other than the stream, are plain
@@ -761,42 +1300,44 @@ module Minitest
         )
         private_constant :LIST_KEY_RESULT_TYPES
 
-        # Refreshes the expiry of every key this run owns. Issued on the caller's
-        # pipeline, so it costs no extra round trip. `EXPIRE` on a key that does not
-        # exist is a no-op, so keys the run never writes are fine.
-        sig { params(pipeline: T.untyped).void }
-        def refresh_key_ttls(pipeline)
-          ttl = configuration.key_ttl_seconds
-          pipeline.expire(stream_key, ttl)
-          pipeline.expire(key("retry_set"), ttl)
-          pipeline.expire(key("production_complete"), ttl)
-          pipeline.expire(key("stalled"), ttl)
-          STATS_KEY_NAMES.each { |name| pipeline.expire(key(name), ttl) }
-          LIST_KEY_RESULT_TYPES.each { |result_type| pipeline.expire(list_key(result_type.serialize), ttl) }
+        sig do
+          params(
+            results: ResultAggregate,
+            clear_retry_lists: T::Boolean,
+            allow_missing_stats: T::Boolean,
+          ).void
         end
-
-        sig { params(results: ResultAggregate).void }
-        def adjust_combined_results(results)
-          updated = redis.multi do |pipeline|
-            pipeline.incrby(key("runs"), results.runs)
-            pipeline.incrby(key("assertions"), results.assertions)
-            pipeline.incrby(key("passes"), results.passes)
-            pipeline.incrby(key("failures"), results.failures)
-            pipeline.incrby(key("errors"), results.errors)
-            pipeline.incrby(key("skips"), results.skips)
-            pipeline.incrby(key("requeues"), results.requeues)
-            pipeline.incrby(key("discards"), results.discards)
-            pipeline.incrby(key("acks"), results.acks)
-            pipeline.incrby(key("size"), results.size)
-
-            # Keep the run's keys on a sliding expiry. This runs after the INCRBYs so
-            # the positional results below are unaffected. Test-result commits refresh
-            # the same keys in `commit_results_script`, so they stay alive for the
-            # duration of both production and consumption.
-            refresh_key_ttls(pipeline)
-          end
-
-          update_combined_results(T.cast(updated.take(10), T::Array[Integer]))
+        def adjust_combined_results(results, clear_retry_lists: false, allow_missing_stats: false)
+          generation = T.must(@attempt_generation)
+          keys = [
+            key("attempt_generation"),
+            stream_key,
+            key("retry_set"),
+            key("production_complete"),
+            key("production_heartbeat"),
+            key("stalled"),
+            key("truncated"),
+          ]
+          keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
+          keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
+          argv = [
+            generation,
+            configuration.key_ttl_seconds,
+            clear_retry_lists ? 1 : 0,
+            allow_missing_stats ? 1 : 0,
+            results.runs,
+            results.assertions,
+            results.passes,
+            results.failures,
+            results.errors,
+            results.skips,
+            results.requeues,
+            results.discards,
+            results.acks,
+            results.size,
+          ]
+          updated = execute_script(script_name: :adjust_results, keys: keys, argv: argv)
+          update_combined_results(T.cast(updated, T::Array[Integer]))
         end
 
         sig { params(name: String).returns(String) }
@@ -816,7 +1357,7 @@ module Minitest
         end
         def commit_results(results)
           arguments = T.let(
-            [group_name, configuration.key_ttl_seconds, results.size],
+            [group_name, configuration.key_ttl_seconds, results.size, T.must(@attempt_generation)],
             T::Array[T.untyped],
           )
           results.each do |enqueued_runnable, result|
@@ -832,12 +1373,42 @@ module Minitest
           keys = [stream_key, key("retry_set")]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.concat([key("production_complete"), key("stalled")])
+          keys.concat([
+            key("production_complete"),
+            key("stalled"),
+            key("production_heartbeat"),
+            key("attempt_generation"),
+            key("truncated"),
+          ])
 
-          response = T.unsafe(redis.evalsha(commit_results_script, keys: keys, argv: arguments))
-          commit_statuses = response.take(results.size)
+          response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
+          commit_statuses = T.cast(response.take(results.size), T::Array[Integer])
           update_combined_results(T.cast(response.drop(results.size), T::Array[Integer]))
+          build_runnable_results(results, commit_statuses)
+        rescue Redis::CommandError => error
+          cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORSTREAM") ||
+            error.message.include?("no such key")
+          raise unless cleanup_race_error
 
+          # Another worker may have completed and cleaned up while this batch was
+          # running. Preserve the reporter contract by presenting these local
+          # results as uncommitted/discarded, but only when fresh counters prove
+          # the shared run is already terminal. Incomplete state is handled by
+          # consume's fail-closed coordinator-state path.
+          @combined_results = nil
+          terminal_results = combined_results
+          raise unless run_complete?(terminal_results) || terminal_results.abort?
+
+          build_runnable_results(results, Array.new(results.size, 0))
+        end
+
+        sig do
+          params(
+            results: T::Array[[EnqueuedRunnable, Minitest::Result]],
+            commit_statuses: T::Array[Integer],
+          ).returns(T::Array[EnqueuedRunnable::Result])
+        end
+        def build_runnable_results(results, commit_statuses)
           results.each_with_index.map do |(enqueued_runnable, result), index|
             commit = if commit_statuses.fetch(index) == 1
               EnqueuedRunnable::Result::Commit.success
@@ -902,10 +1473,19 @@ module Minitest
           [backoff << 1, MAX_BACKOFF].min
         end
 
+        BASE_GROUP_NAME = "minitest-distributed"
+        private_constant :BASE_GROUP_NAME
+
         # Confirm a drained mismatch because the diagnostic probe itself uses
         # multiple pipelined Redis commands and is not an atomic snapshot.
         STALL_CONFIRMATION_SECONDS = 30.0
         private_constant :STALL_CONFIRMATION_SECONDS
+
+        MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS = 30.0
+        private_constant :MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS
+
+        PRODUCTION_BATCH_SIZE = 100
+        private_constant :PRODUCTION_BATCH_SIZE
 
         INITIAL_BACKOFF = 10 # milliseconds
         private_constant :INITIAL_BACKOFF

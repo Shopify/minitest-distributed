@@ -33,6 +33,60 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(100, results.passes)
   end
 
+  def test_retry_with_missing_statistic_runs_the_full_suite
+    run_id = "test_retry_with_missing_statistic_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.del("minitest/#{run_id}/assertions")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.runs)
+    assert_equal(100, results.assertions)
+    assert_equal(100, results.passes)
+  end
+
+  def test_retry_with_invalid_counter_runs_the_full_suite
+    run_id = "test_retry_with_invalid_counter_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/#{run_id}/acks", "not-a-number")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.acks)
+    assert_equal(100, results.passes)
+  end
+
+  def test_retry_with_missing_failure_list_runs_the_full_suite
+    run_id = "test_retry_with_missing_failure_list_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    @redis.del("minitest/#{run_id}/failed_list")
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.runs)
+    assert_equal(99, results.passes)
+    assert_equal(1, results.failures)
+    assert_equal(0, results.requeues)
+  end
+
   def test_retry_failed_build_with_consistently_failing_test
     worker1 = spawn_redis_worker(
       test_file: "failing_tests.rb",
@@ -99,6 +153,14 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(99, results.passes)
     assert_equal(1, results.failures)
     assert_equal(0, results.requeues)
+
+    worker3 = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: "test_retry_failed_build_with_retry_mode_disabled",
+      arguments: { "--no-retry-failures" => "true" },
+    ).value
+    assert_worker_successful(worker3)
+    refute_includes(worker3.stdout, "Running the full test suite")
   end
 
   def test_retry_failed_build_with_intermittently_failing_test
@@ -185,6 +247,21 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(250, results.requeues)
   end
 
+  def test_new_max_failures_does_not_reclassify_a_completed_run_as_truncated
+    run_id = "test_new_max_failures_does_not_reclassify_a_completed_run_as_truncated"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    worker2 = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      arguments: { "--no-retry-failures" => "true", "--max-failures" => "1" },
+    ).value
+
+    assert_worker_successful(worker2)
+    refute(@redis.exists?("minitest/#{run_id}/truncated"))
+  end
+
   def test_retry_attempt_on_run_that_was_cut_short
     # When we the initial attempt is cut short because we reach the maximum number
     # of failures, we have to decide what to do when a retry is attempted.
@@ -224,6 +301,16 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(0, new_results.passes)
     assert_equal(10, new_results.failures)
     assert_equal(0, new_results.requeues)
+
+    # Removing the limit on a later invocation must not make the truncated
+    # attempt eligible for a selective retry: many tests were never run.
+    worker3 = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: "test_retry_attempt_on_run_that_was_cut_short",
+      arguments: { "--retry-failures" => "true" },
+    ).value
+    refute_worker_successful(worker3)
+    assert_includes(worker3.stdout, "Cannot retry a run that was cut short during the previous attempt.")
   end
 
   def test_retry_attempt_on_run_that_was_cut_short_with_flaky_tests
