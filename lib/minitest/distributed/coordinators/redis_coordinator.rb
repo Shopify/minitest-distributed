@@ -168,7 +168,7 @@ module Minitest
           ]
           registration_keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           registration_keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          registration_keys << key("truncated")
+          registration_keys.push(key("truncated"), key("completed_at"))
           registration = T.unsafe(execute_script(
             script_name: :register_consumergroup,
             keys: registration_keys,
@@ -177,6 +177,7 @@ module Minitest
               configuration.key_ttl_seconds,
               configuration.max_failures || "",
               SecureRandom.uuid,
+              COMPLETED_ATTEMPT_GRACE_SECONDS,
             ],
           ))
 
@@ -433,11 +434,12 @@ module Minitest
           @register_consumergroup_script ||= redis.script(:load, <<~LUA)
             -- KEYS: stream, generation token, stalled, production_complete,
             -- production_heartbeat, retry_set, ten statistics, the
-            -- skipped/failed/error lists, then truncated.
+            -- skipped/failed/error lists, truncated, then completed_at.
             local stream_exists = redis.call('EXISTS', KEYS[1]) == 1
             local current_generation = redis.call('GET', KEYS[2])
             local stalled = redis.call('EXISTS', KEYS[3]) == 1
             local truncated = redis.call('EXISTS', KEYS[20]) == 1
+            local invalid_active_state = false
 
             local required_stats = {}
             for key_index = 7, 16 do
@@ -467,7 +469,23 @@ module Minitest
                 completed = not invalid_terminal_counters and acks == size
               end
 
-              if not completed and not invalid_terminal_counters then
+              if completed then
+                local completed_at = nil
+                if redis.call('TYPE', KEYS[21]).ok == 'string' then
+                  completed_at = tonumber(redis.call('GET', KEYS[21]))
+                end
+                if completed_at then
+                  local redis_time = redis.call('TIME')
+                  local now = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
+                  if now - completed_at < tonumber(ARGV[5]) then
+                    return {0, current_generation, -1, {}, {}}
+                  end
+                else
+                  invalid_active_state = true
+                end
+              elseif invalid_terminal_counters then
+                invalid_active_state = true
+              else
                 return {0, current_generation, -1, {}, {}}
               end
             end
@@ -476,7 +494,7 @@ module Minitest
             local previous_failures = {}
             local previous_errors = {}
 
-            if stalled then
+            if stalled or invalid_active_state then
               mode = 2 -- fail-closed full rerun
             elseif existing_stat_count == 10 then
               local stat_values = {}
@@ -530,7 +548,7 @@ module Minitest
               -- not a genuinely new run ID. The generation token is excluded
               -- because it intentionally survives cleanup until the shared TTL.
               local auxiliary_count = redis.call(
-                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20]
+                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21]
               )
               if auxiliary_count > 0 then
                 mode = 2
@@ -542,13 +560,13 @@ module Minitest
             -- attempt. All destructive changes and group creation are atomic.
             redis.call('DEL', KEYS[1])
             if mode == 2 then
-              for key_index = 3, 20 do
+              for key_index = 3, 21 do
                 redis.call('DEL', KEYS[key_index])
               end
               previous_failures = {}
               previous_errors = {}
             else
-              redis.call('DEL', KEYS[4], KEYS[5])
+              redis.call('DEL', KEYS[4], KEYS[5], KEYS[21])
               if mode == 1 or mode == 3 then
                 redis.call('SET', KEYS[15], 0)
                 redis.call('SET', KEYS[16], 0)
@@ -712,6 +730,14 @@ module Minitest
               reply[result_count + stat_index] = redis.call('INCRBY', KEYS[stat_index + 2], deltas[stat_index])
             end
 
+            local updated_acks = reply[result_count + 9]
+            local updated_size = reply[result_count + 10]
+            if updated_acks == updated_size and redis.call('EXISTS', KEYS[16]) == 1 then
+              local redis_time = redis.call('TIME')
+              local completed_at = redis_time[1] .. '.' .. redis_time[2]
+              redis.call('SET', KEYS[21], completed_at, 'EX', ARGV[2])
+            end
+
             for key_index = 1, #KEYS do
               redis.call('EXPIRE', KEYS[key_index], ARGV[2])
             end
@@ -805,6 +831,14 @@ module Minitest
             if not group_exists then
               return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[5])
             end
+            if redis.call('TYPE', KEYS[5]).ok ~= 'string' or redis.call('TYPE', KEYS[6]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing completion counters')
+            end
+            local acks = tonumber(redis.call('GET', KEYS[5]))
+            local size = tonumber(redis.call('GET', KEYS[6]))
+            if not acks or not size then
+              return redis.error_reply('COORDINATORSTATE invalid completion counters')
+            end
 
             local test_count = tonumber(ARGV[4])
             local argument_index = 6
@@ -818,6 +852,11 @@ module Minitest
             end
             if ARGV[3] == '1' then
               redis.call('SET', KEYS[3], 1, 'EX', ARGV[2])
+              if acks == size then
+                local redis_time = redis.call('TIME')
+                local completed_at = redis_time[1] .. '.' .. redis_time[2]
+                redis.call('SET', KEYS[7], completed_at, 'EX', ARGV[2])
+              end
             end
             for key_index = 1, #KEYS do
               redis.call('EXPIRE', KEYS[key_index], ARGV[2])
@@ -940,7 +979,9 @@ module Minitest
             block: block,
             count: configuration.test_batch_size,
           )
-          EnqueuedRunnable.from_redis_stream_claim(result.fetch(stream_key, []), configuration: configuration)
+          claims = result.fetch(stream_key, [])
+          @combined_results = nil if claims.any?
+          EnqueuedRunnable.from_redis_stream_claim(claims, configuration: configuration)
         end
 
         sig do
@@ -1083,6 +1124,9 @@ module Minitest
                 stream_key,
                 key("production_complete"),
                 key("production_heartbeat"),
+                key("acks"),
+                key("size"),
+                key("completed_at"),
               ],
               argv: argv,
             )
@@ -1324,6 +1368,7 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
+          keys << key("completed_at")
           argv = [
             generation,
             configuration.key_ttl_seconds,
@@ -1383,6 +1428,7 @@ module Minitest
             key("production_heartbeat"),
             key("attempt_generation"),
             key("truncated"),
+            key("completed_at"),
           )
 
           response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
@@ -1487,6 +1533,9 @@ module Minitest
 
         MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS = 30.0
         private_constant :MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS
+
+        COMPLETED_ATTEMPT_GRACE_SECONDS = 30.0
+        private_constant :COMPLETED_ATTEMPT_GRACE_SECONDS
 
         PRODUCTION_BATCH_SIZE = 100
         private_constant :PRODUCTION_BATCH_SIZE

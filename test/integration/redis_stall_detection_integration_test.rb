@@ -147,6 +147,7 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     old_coordinator = T.cast(old_configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
     old_coordinator.produce(test_selector: empty_test_selector)
     old_generation = String(@redis.get("minitest/#{run_id}/attempt_generation"))
+    @redis.set("minitest/#{run_id}/completed_at", (Time.now.to_f - 60).to_s)
 
     new_configuration = redis_configuration(run_id: run_id, worker_id: "new-worker")
     new_coordinator = T.cast(new_configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
