@@ -401,6 +401,11 @@ module Minitest
           else
             raise
           end
+        ensure
+          # Another worker may commit the final batch and clean up while this
+          # worker is unwinding from NOGROUP. Report and validate against one
+          # last fresh aggregate rather than a pre-cleanup local cache.
+          @combined_results = nil
         end
         # rubocop:enable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
 
