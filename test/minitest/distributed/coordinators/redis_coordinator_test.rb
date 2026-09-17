@@ -82,6 +82,101 @@ module Minitest
           assert_equal([EXPECTED_MAX_BACKOFF] * 5, captured_blocks.last(5))
         end
 
+        def test_pre_publish_zero_work_snapshot_does_not_trigger_max_failures_truncation
+          stale_claim_calls = 0
+          marked_truncated = T.let(false, T::Boolean)
+          fake_results = Object.new
+          fake_results.define_singleton_method(:complete?) { true }
+          fake_results.define_singleton_method(:abort?) { true }
+          fake_results.define_singleton_method(:acks) { 0 }
+          fake_results.define_singleton_method(:size) { 0 }
+
+          @coordinator.define_singleton_method(:claim_stale_runnables) do
+            stale_claim_calls += 1
+            raise "stop consume" if stale_claim_calls > 1
+
+            []
+          end
+          @coordinator.define_singleton_method(:claim_fresh_runnables) { |**_kwargs| [] }
+          @coordinator.define_singleton_method(:combined_results) { fake_results }
+          @coordinator.define_singleton_method(:run_complete?) { |*_args| false }
+          @coordinator.define_singleton_method(:current_production_heartbeat) { nil }
+          @coordinator.define_singleton_method(:mark_run_truncated) { marked_truncated = true }
+
+          assert_raises(RuntimeError) do
+            @coordinator.consume(reporter: Minitest::CompositeReporter.new)
+          end
+          refute(marked_truncated)
+        end
+
+        def test_consume_does_not_classify_application_argument_errors_as_coordinator_corruption
+          @coordinator.define_singleton_method(:combined_results) do
+            ResultAggregate.new(acks: 0, size: 1)
+          end
+          @coordinator.define_singleton_method(:current_production_heartbeat) { nil }
+          @coordinator.define_singleton_method(:claim_stale_runnables) { [Object.new] }
+          @coordinator.define_singleton_method(:process_batch) do |*_args|
+            raise ArgumentError, "application bug"
+          end
+
+          error = T.let(nil, T.nilable(ArgumentError))
+          begin
+            @coordinator.consume(reporter: Minitest::CompositeReporter.new)
+          rescue ArgumentError => raised_error
+            error = raised_error
+          end
+          assert_equal("application bug", T.must(error).message)
+          refute_predicate(@coordinator, :aborted?)
+        end
+
+        def test_consume_invalidates_memoized_results_before_polling
+          observed_cache = T.let(Object.new, T.untyped)
+          cached_results = ResultAggregate.new(acks: 0, size: 1)
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results, cached_results)
+          @coordinator.define_singleton_method(:current_production_heartbeat) { nil }
+          @coordinator.define_singleton_method(:claim_stale_runnables) do
+            observed_cache = instance_variable_get(:@combined_results)
+            raise "stop consume"
+          end
+
+          assert_raises(RuntimeError) do
+            @coordinator.consume(reporter: Minitest::CompositeReporter.new)
+          end
+          assert_nil(observed_cache)
+        end
+
+        def test_production_heartbeat_retries_transient_connection_errors
+          attempts = 0
+          @coordinator.configuration.stall_timeout_seconds = 0.02
+          T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "generation")
+          @coordinator.define_singleton_method(:execute_script) do |**_kwargs|
+            attempts += 1
+            raise Redis::CannotConnectError, "temporary failure" if attempts == 1
+
+            0
+          end
+
+          thread = T.cast(@coordinator.send(:start_production_heartbeat), Thread)
+          thread.join(1)
+          @coordinator.send(:stop_production_heartbeat, thread, propagate_error: true)
+
+          assert_equal(2, attempts)
+        end
+
+        def test_production_heartbeat_surfaces_non_connection_errors
+          @coordinator.configuration.stall_timeout_seconds = 0.02
+          T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "generation")
+          @coordinator.define_singleton_method(:execute_script) do |**_kwargs|
+            raise Redis::CommandError, "invalid heartbeat state"
+          end
+
+          thread = T.cast(@coordinator.send(:start_production_heartbeat), Thread)
+          thread.join(1)
+          assert_raises(Redis::CommandError) do
+            @coordinator.send(:stop_production_heartbeat, thread, propagate_error: true)
+          end
+        end
+
         def test_next_backoff_caps_within_a_bounded_number_of_iterations
           # Sanity check the doubling math: starting from INITIAL_BACKOFF, the cap must
           # be reached within a small, bounded number of iterations so that consume()

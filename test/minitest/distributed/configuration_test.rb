@@ -23,6 +23,22 @@ module Minitest
 
         assert_raises(ArgumentError) { configuration.coordinator }
       end
+
+      def test_completion_grace_defaults_to_thirty_seconds
+        assert_equal(30.0, Configuration.from_env({}).completion_grace_seconds)
+      end
+
+      def test_rejects_non_positive_completion_grace
+        configuration = Configuration.new(completion_grace_seconds: 0.0)
+
+        assert_raises(ArgumentError) { configuration.coordinator }
+      end
+
+      def test_rejects_non_finite_completion_grace
+        configuration = Configuration.new(completion_grace_seconds: Float::INFINITY)
+
+        assert_raises(ArgumentError) { configuration.coordinator }
+      end
     end
   end
 end

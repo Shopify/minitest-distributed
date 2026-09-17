@@ -25,10 +25,15 @@ module Minitest
           print_discard_warning if local_results.discards > 0
 
           if configuration.coordinator.aborted?
-            unless coordinator_stalled?
-              io.puts("Cannot retry a run that was cut short during the previous attempt.")
-              io.puts
+            if coordinator_stalled?
+              formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
+              io.puts("This worker: #{local_results} #{formatted_duration}")
+              io.puts("Combined results are unavailable because the Redis coordinator state is invalid.")
+              return
             end
+
+            io.puts("Cannot retry a run that was cut short during the previous attempt.")
+            io.puts
           elsif combined_results.abort?
             io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
             io.puts

@@ -44,6 +44,9 @@ module Minitest
         extend T::Sig
         include CoordinatorInterface
 
+        class CoordinatorStateError < StandardError; end
+        private_constant :CoordinatorStateError
+
         class StallProbe < T::Struct
           const :acks, T.nilable(Integer)
           const :size, T.nilable(Integer)
@@ -93,6 +96,7 @@ module Minitest
           @group_name = T.let(BASE_GROUP_NAME, String)
           @attempt_generation = T.let(nil, T.nilable(String))
           @production_complete = T.let(false, T::Boolean)
+          @production_heartbeat_error = T.let(nil, T.nilable(StandardError))
           @local_results = T.let(ResultAggregate.new, ResultAggregate)
           @combined_results = T.let(nil, T.nilable(ResultAggregate))
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
@@ -143,6 +147,8 @@ module Minitest
               size: Integer(stats_as_string.fetch(9) || 2_147_483_647),
             )
           end
+        rescue ArgumentError, TypeError => parse_error
+          raise CoordinatorStateError, "invalid Redis aggregate: #{parse_error.message}"
         end
 
         sig { override.returns(T::Boolean) }
@@ -158,6 +164,7 @@ module Minitest
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
           production_heartbeat_thread = T.let(nil, T.nilable(Thread))
+          propagate_heartbeat_error = T.let(false, T::Boolean)
 
           registration_keys = [
             stream_key,
@@ -183,7 +190,7 @@ module Minitest
                 configuration.key_ttl_seconds,
                 configuration.max_failures || "",
                 SecureRandom.uuid,
-                COMPLETED_ATTEMPT_GRACE_SECONDS,
+                configuration.completion_grace_seconds,
                 ignore_completion_grace ? 1 : 0,
               ],
             ))
@@ -253,8 +260,14 @@ module Minitest
           )
 
           publish_tests(tests)
+          propagate_heartbeat_error = true
         ensure
-          stop_production_heartbeat(production_heartbeat_thread) if production_heartbeat_thread
+          if production_heartbeat_thread
+            stop_production_heartbeat(
+              production_heartbeat_thread,
+              propagate_error: propagate_heartbeat_error,
+            )
+          end
         end
 
         # The loop intentionally keeps the stale/fresh claim and diagnostic state
@@ -273,6 +286,10 @@ module Minitest
           incomplete_production_detected_at = T.let(nil, T.nilable(Float))
 
           loop do
+            # Other workers can advance or complete the run without touching this
+            # process's memoized aggregate. Refresh once per polling iteration.
+            @combined_results = nil
+
             # First, see if there are any pending tests from other workers to claim.
             stale_runnables = claim_stale_runnables
             process_batch(stale_runnables, reporter)
@@ -292,7 +309,7 @@ module Minitest
             break if run_complete?(run_results)
 
             # We also abort a run if we reach the maximum number of failures.
-            if run_results.abort?
+            if run_results.abort? && !run_results.complete?
               mark_run_truncated
               break
             end
@@ -422,7 +439,7 @@ module Minitest
           else
             raise
           end
-        rescue ArgumentError, TypeError => parse_error
+        rescue CoordinatorStateError => parse_error
           abort_with_diagnostic(<<~DIAGNOSTIC)
             ERROR: minitest-distributed could not parse Redis coordinator state.
             run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
@@ -469,10 +486,38 @@ module Minitest
             -- production_heartbeat, retry_set, ten statistics, the
             -- skipped/failed/error lists, truncated, then completed_at.
             local stream_exists = redis.call('EXISTS', KEYS[1]) == 1
-            local current_generation = redis.call('GET', KEYS[2])
+            local generation_type = redis.call('TYPE', KEYS[2]).ok
+            local current_generation = nil
+            local invalid_active_state = false
+            if generation_type == 'string' then
+              current_generation = redis.call('GET', KEYS[2])
+            elseif generation_type ~= 'none' then
+              invalid_active_state = true
+            end
             local stalled = redis.call('EXISTS', KEYS[3]) == 1
             local truncated = redis.call('EXISTS', KEYS[20]) == 1
-            local invalid_active_state = false
+            local production_complete_type = redis.call('TYPE', KEYS[4]).ok
+            if production_complete_type ~= 'none' and production_complete_type ~= 'string' then
+              invalid_active_state = true
+            elseif production_complete_type == 'string' and redis.call('GET', KEYS[4]) ~= '1' then
+              invalid_active_state = true
+            end
+            local max_safe_integer = 9007199254740991
+
+            local function read_safe_integer(key)
+              if redis.call('TYPE', key).ok ~= 'string' then
+                return nil
+              end
+              local validation = redis.pcall('INCRBY', key, 0)
+              if type(validation) == 'table' and validation.err then
+                return nil
+              end
+              local value = tonumber(validation)
+              if not value or math.abs(value) > max_safe_integer then
+                return nil
+              end
+              return value
+            end
 
             local required_stats = {}
             for key_index = 7, 16 do
@@ -488,16 +533,8 @@ module Minitest
               local completed = false
               local invalid_terminal_counters = false
               if existing_stat_count == 10 and redis.call('EXISTS', KEYS[4]) == 1 then
-                local acks_type = redis.call('TYPE', KEYS[15]).ok
-                local size_type = redis.call('TYPE', KEYS[16]).ok
-                local acks = nil
-                local size = nil
-                if acks_type == 'string' then
-                  acks = tonumber(redis.call('GET', KEYS[15]))
-                end
-                if size_type == 'string' then
-                  size = tonumber(redis.call('GET', KEYS[16]))
-                end
+                local acks = read_safe_integer(KEYS[15])
+                local size = read_safe_integer(KEYS[16])
                 invalid_terminal_counters = not acks or not size
                 completed = not invalid_terminal_counters and acks == size
               end
@@ -533,11 +570,7 @@ module Minitest
               local stat_values = {}
               local numeric_stats = true
               for key_index = 7, 16 do
-                local key_type = redis.call('TYPE', KEYS[key_index]).ok
-                local value = nil
-                if key_type == 'string' then
-                  value = tonumber(redis.call('GET', KEYS[key_index]))
-                end
+                local value = read_safe_integer(KEYS[key_index])
                 if not value then
                   numeric_stats = false
                 else
@@ -560,9 +593,13 @@ module Minitest
                   if redis.call('EXISTS', KEYS[4]) == 0 then
                     mode = 2
                   else
+                    local retry_set_type = redis.call('TYPE', KEYS[6]).ok
+                    local skipped_list_type = redis.call('TYPE', KEYS[17]).ok
                     local failed_list_type = redis.call('TYPE', KEYS[18]).ok
                     local error_list_type = redis.call('TYPE', KEYS[19]).ok
-                    if (failed_list_type ~= 'none' and failed_list_type ~= 'list') or
+                    if (retry_set_type ~= 'none' and retry_set_type ~= 'set') or
+                      (skipped_list_type ~= 'none' and skipped_list_type ~= 'list') or
+                      (failed_list_type ~= 'none' and failed_list_type ~= 'list') or
                       (error_list_type ~= 'none' and error_list_type ~= 'list') then
                       mode = 2
                     else
@@ -612,7 +649,7 @@ module Minitest
                   remaining_grace = grace
                 end
                 if remaining_grace > 0 then
-                  return {0, current_generation, -2, {}, {}, remaining_grace}
+                  return {0, current_generation, -2, {}, {}, tostring(remaining_grace)}
                 end
               end
             end
@@ -628,7 +665,7 @@ module Minitest
               previous_failures = {}
               previous_errors = {}
             else
-              redis.call('DEL', KEYS[4], KEYS[5], KEYS[21])
+              redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[21])
               if mode == 1 or mode == 3 then
                 redis.call('SET', KEYS[15], 0, 'EX', ARGV[2])
                 redis.call('SET', KEYS[16], 0, 'EX', ARGV[2])
@@ -666,6 +703,9 @@ module Minitest
             -- make an incomplete run look complete when both acks and size become
             -- 0. This preflight occurs before any write because Redis does not
             -- roll back earlier script writes when a later command errors.
+            if redis.call('TYPE', KEYS[19]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing or invalid key ' .. KEYS[19])
+            end
             local current_generation = redis.call('GET', KEYS[19])
             if not current_generation then
               return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[19])
@@ -796,7 +836,7 @@ module Minitest
             local updated_size = reply[result_count + 10]
             if updated_acks == updated_size and redis.call('EXISTS', KEYS[16]) == 1 then
               local redis_time = redis.call('TIME')
-              local completed_at = redis_time[1] .. '.' .. redis_time[2]
+              local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
               redis.call('SET', KEYS[21], completed_at, 'EX', ARGV[2])
             end
 
@@ -811,6 +851,9 @@ module Minitest
         sig { returns(String) }
         def adjust_results_script
           @adjust_results_script ||= redis.script(:load, <<~LUA)
+            if redis.call('TYPE', KEYS[1]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing or invalid key ' .. KEYS[1])
+            end
             local current_generation = redis.call('GET', KEYS[1])
             if not current_generation then
               return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[1])
@@ -870,6 +913,9 @@ module Minitest
         sig { returns(String) }
         def publish_tests_script
           @publish_tests_script ||= redis.script(:load, <<~LUA)
+            if redis.call('TYPE', KEYS[1]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing or invalid key ' .. KEYS[1])
+            end
             local current_generation = redis.call('GET', KEYS[1])
             if not current_generation then
               return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[1])
@@ -916,7 +962,7 @@ module Minitest
               redis.call('SET', KEYS[3], 1, 'EX', ARGV[2])
               if acks == size then
                 local redis_time = redis.call('TIME')
-                local completed_at = redis_time[1] .. '.' .. redis_time[2]
+                local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
                 redis.call('SET', KEYS[7], completed_at, 'EX', ARGV[2])
               end
             end
@@ -930,9 +976,19 @@ module Minitest
         sig { returns(String) }
         def heartbeat_script
           @heartbeat_script ||= redis.script(:load, <<~LUA)
+            local generation_type = redis.call('TYPE', KEYS[1]).ok
+            if generation_type == 'none' then
+              return 0
+            elseif generation_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid key type ' .. KEYS[1])
+            end
             local current_generation = redis.call('GET', KEYS[1])
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
+            end
+            local heartbeat_type = redis.call('TYPE', KEYS[2]).ok
+            if heartbeat_type ~= 'none' and heartbeat_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid key type ' .. KEYS[2])
             end
             redis.call('INCR', KEYS[2])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -944,6 +1000,9 @@ module Minitest
         sig { returns(String) }
         def mark_attempt_state_script
           @mark_attempt_state_script ||= redis.script(:load, <<~LUA)
+            if redis.call('TYPE', KEYS[1]).ok ~= 'string' then
+              return 0
+            end
             local current_generation = redis.call('GET', KEYS[1])
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
@@ -957,6 +1016,9 @@ module Minitest
         sig { returns(String) }
         def cleanup_script
           @cleanup_script ||= redis.script(:load, <<~LUA)
+            if redis.call('TYPE', KEYS[2]).ok ~= 'string' then
+              return 0
+            end
             local current_generation = redis.call('GET', KEYS[2])
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
@@ -971,6 +1033,9 @@ module Minitest
         sig { returns(String) }
         def abort_script
           @abort_script ||= redis.script(:load, <<~LUA)
+            if redis.call('TYPE', KEYS[2]).ok ~= 'string' then
+              return 0
+            end
             local current_generation = redis.call('GET', KEYS[2])
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
@@ -1217,24 +1282,37 @@ module Minitest
         def start_production_heartbeat
           generation = T.must(@attempt_generation)
           interval = [configuration.stall_timeout_seconds / 2, MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS].min
+          @production_heartbeat_error = nil
           Thread.new do
             Thread.current.report_on_exception = false
             loop do
               sleep(interval)
-              updated = execute_script(
-                script_name: :heartbeat,
-                keys: [key("attempt_generation"), key("production_heartbeat")],
-                argv: [generation, configuration.key_ttl_seconds],
-              )
-              break unless updated == 1
+              begin
+                updated = execute_script(
+                  script_name: :heartbeat,
+                  keys: [key("attempt_generation"), key("production_heartbeat")],
+                  argv: [generation, configuration.key_ttl_seconds],
+                )
+                break unless updated == 1
+              rescue Redis::BaseConnectionError
+                # Redis clients reconnect on the next command. Keep this watchdog
+                # alive so a transient connection failure does not silently stop
+                # heartbeats during slow test discovery.
+                next
+              rescue StandardError => error
+                @production_heartbeat_error = error
+                break
+              end
             end
           end
         end
 
-        sig { params(thread: Thread).void }
-        def stop_production_heartbeat(thread)
+        sig { params(thread: Thread, propagate_error: T::Boolean).void }
+        def stop_production_heartbeat(thread, propagate_error:)
           thread.kill
           thread.join
+          heartbeat_error = @production_heartbeat_error
+          raise heartbeat_error if heartbeat_error && propagate_error
         end
 
         sig { params(results: ResultAggregate).returns(T::Boolean) }
@@ -1244,12 +1322,25 @@ module Minitest
 
         sig { returns(T::Boolean) }
         def production_complete?
-          @production_complete ||= redis.exists?(key("production_complete"))
+          return @production_complete if @production_complete
+
+          marker = read_control_string("production_complete")
+          return false unless marker
+
+          raise CoordinatorStateError, "production_complete=#{marker.inspect}" unless marker == "1"
+
+          @production_complete = true
         end
 
         sig { returns(T.nilable(Integer)) }
         def current_production_heartbeat
-          parse_redis_integer(redis.get(key("production_heartbeat")))
+          raw_heartbeat = read_control_string("production_heartbeat")
+          return unless raw_heartbeat
+
+          heartbeat = parse_redis_integer(raw_heartbeat)
+          raise CoordinatorStateError, "production_heartbeat=#{raw_heartbeat.inspect}" unless heartbeat
+
+          heartbeat
         end
 
         # Read all the state needed to distinguish a legitimately slow pending
@@ -1257,12 +1348,16 @@ module Minitest
         # This deliberately bypasses `@combined_results`, which is memoized.
         sig { returns(StallProbe) }
         def probe_stall
-          counters, pending_summary, groups, stream_info = redis.pipelined do |pipeline|
-            pipeline.mget(key("acks"), key("size"), key("production_complete"), key("production_heartbeat"))
-            pipeline.xpending(stream_key, group_name)
-            pipeline.xinfo("groups", stream_key)
-            pipeline.xinfo("stream", stream_key)
-          end
+          counters, pending_summary, groups, stream_info, production_complete_type, heartbeat_type,
+            generation_type = redis.pipelined do |pipeline|
+              pipeline.mget(key("acks"), key("size"), key("production_complete"), key("production_heartbeat"))
+              pipeline.xpending(stream_key, group_name)
+              pipeline.xinfo("groups", stream_key)
+              pipeline.xinfo("stream", stream_key)
+              pipeline.call("TYPE", key("production_complete"))
+              pipeline.call("TYPE", key("production_heartbeat"))
+              pipeline.call("TYPE", key("attempt_generation"))
+            end
 
           raw_acks, raw_size, raw_production_complete, raw_production_heartbeat = T.unsafe(counters)
           group = T.unsafe(groups).find { |candidate| candidate.fetch("name") == group_name }
@@ -1272,6 +1367,16 @@ module Minitest
           size = parse_redis_integer(raw_size)
           lag = parse_redis_integer(raw_lag)
           production_heartbeat = parse_redis_integer(raw_production_heartbeat)
+          unless ["none", "string"].include?(production_complete_type)
+            invalid_values << "production_complete_type=#{production_complete_type}"
+          end
+          unless ["none", "string"].include?(heartbeat_type)
+            invalid_values << "production_heartbeat_type=#{heartbeat_type}"
+          end
+          invalid_values << "attempt_generation_type=#{generation_type}" unless generation_type == "string"
+          if !raw_production_complete.nil? && raw_production_complete != "1"
+            invalid_values << "production_complete=#{raw_production_complete.inspect}"
+          end
           invalid_values << "acks=#{raw_acks.inspect}" if !raw_acks.nil? && acks.nil?
           invalid_values << "size=#{raw_size.inspect}" if !raw_size.nil? && size.nil?
           invalid_values << "lag=#{raw_lag.inspect}" if !raw_lag.nil? && lag.nil?
@@ -1295,7 +1400,7 @@ module Minitest
             size: size,
             pending_count: pending_count || 0,
             lag: lag,
-            production_complete: !raw_production_complete.nil?,
+            production_complete: raw_production_complete == "1",
             production_heartbeat: production_heartbeat,
             invalid_values: invalid_values,
           )
@@ -1313,7 +1418,7 @@ module Minitest
           @combined_results = nil
           begin
             results = combined_results
-          rescue ArgumentError, TypeError => parse_error
+          rescue CoordinatorStateError => parse_error
             abort_with_diagnostic(<<~DIAGNOSTIC)
               ERROR: minitest-distributed could not parse Redis coordinator statistics.
               run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
@@ -1332,6 +1437,12 @@ module Minitest
             The run is incomplete, so this was not normal cleanup. A run key may have expired, been evicted, or been deleted.
           DIAGNOSTIC
           abort_with_diagnostic(diagnostic)
+        rescue CoordinatorStateError => parse_error
+          abort_with_diagnostic(<<~DIAGNOSTIC)
+            ERROR: minitest-distributed could not parse Redis coordinator state.
+            run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+            redis_error=#{error.message.inspect} parse_error=#{parse_error.message.inspect}
+          DIAGNOSTIC
         end
 
         sig { returns(T::Boolean) }
@@ -1339,10 +1450,23 @@ module Minitest
           attempt_generation = @attempt_generation
           return false unless attempt_generation
 
-          current_generation = redis.get(key("attempt_generation"))
+          generation_key = key("attempt_generation")
+          return false unless redis.type(generation_key) == "string"
+
+          current_generation = redis.get(generation_key)
           return false if current_generation.nil?
 
           current_generation != attempt_generation
+        end
+
+        sig { params(name: String).returns(T.nilable(String)) }
+        def read_control_string(name)
+          control_key = key(name)
+          key_type = redis.type(control_key)
+          return if key_type == "none"
+          raise CoordinatorStateError, "#{name} has Redis type #{key_type}" unless key_type == "string"
+
+          redis.get(control_key)
         end
 
         sig { params(diagnostic: String).void }
@@ -1636,9 +1760,6 @@ module Minitest
 
         MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS = 30.0
         private_constant :MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS
-
-        COMPLETED_ATTEMPT_GRACE_SECONDS = 1.0
-        private_constant :COMPLETED_ATTEMPT_GRACE_SECONDS
 
         PRODUCTION_BATCH_SIZE = 100
         private_constant :PRODUCTION_BATCH_SIZE

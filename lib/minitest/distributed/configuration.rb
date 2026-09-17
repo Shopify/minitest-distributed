@@ -16,6 +16,7 @@ module Minitest
       # coordinator forever.
       DEFAULT_KEY_TTL_SECONDS = 86_400 # 24 hours
       DEFAULT_STALL_TIMEOUT_SECONDS = 300.0 # 5 minutes
+      DEFAULT_COMPLETION_GRACE_SECONDS = 30.0
 
       class << self
         extend T::Sig
@@ -32,6 +33,9 @@ module Minitest
             max_failures: (max_failures_env = env["MINITEST_MAX_FAILURES"]) ? Integer(max_failures_env) : nil,
             key_ttl_seconds: Integer(env["MINITEST_KEY_TTL_SECONDS"] || DEFAULT_KEY_TTL_SECONDS),
             stall_timeout_seconds: Float(env["MINITEST_STALL_TIMEOUT_SECONDS"] || DEFAULT_STALL_TIMEOUT_SECONDS),
+            completion_grace_seconds: Float(
+              env["MINITEST_COMPLETION_GRACE_SECONDS"] || DEFAULT_COMPLETION_GRACE_SECONDS,
+            ),
           )
         end
 
@@ -99,6 +103,10 @@ module Minitest
             configuration.stall_timeout_seconds = Float(timeout)
           end
 
+          opts.on("--completion-grace=SECONDS", "Wait before reusing a recently completed run ID") do |grace|
+            configuration.completion_grace_seconds = Float(grace)
+          end
+
           configuration
         end
       end
@@ -120,6 +128,7 @@ module Minitest
       prop :shuffle_suites, T::Boolean, default: true
       prop :key_ttl_seconds, Integer, default: DEFAULT_KEY_TTL_SECONDS
       prop :stall_timeout_seconds, Float, default: DEFAULT_STALL_TIMEOUT_SECONDS
+      prop :completion_grace_seconds, Float, default: DEFAULT_COMPLETION_GRACE_SECONDS
 
       sig { returns(Coordinators::CoordinatorInterface) }
       def coordinator
@@ -143,6 +152,10 @@ module Minitest
 
         unless stall_timeout_seconds.positive? && stall_timeout_seconds.finite?
           raise ArgumentError, "stall_timeout_seconds must be finite and greater than zero"
+        end
+
+        unless completion_grace_seconds.positive? && completion_grace_seconds.finite?
+          raise ArgumentError, "completion_grace_seconds must be finite and greater than zero"
         end
       end
     end

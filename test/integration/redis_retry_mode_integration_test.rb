@@ -106,6 +106,62 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(0, results.requeues)
   end
 
+  def test_retry_with_redis_numeric_syntax_runs_the_full_suite
+    run_id = "test_retry_with_redis_numeric_syntax_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/#{run_id}/assertions", "1e2")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).assertions)
+  end
+
+  def test_retry_with_invalid_retained_state_types_runs_the_full_suite
+    ["retry_set", "skipped_list"].each do |key_name|
+      run_id = "test_retry_with_invalid_#{key_name}_type_runs_the_full_suite"
+      worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+      refute_worker_successful(worker1)
+
+      @redis.del("minitest/#{run_id}/#{key_name}")
+      @redis.set("minitest/#{run_id}/#{key_name}", "wrong-type")
+
+      worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+      refute_worker_successful(worker2)
+      assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+      assert_equal(100, combined_results(run_id: run_id).size)
+    end
+  end
+
+  def test_retry_with_invalid_generation_type_runs_the_full_suite
+    run_id = "test_retry_with_invalid_generation_type_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.del("minitest/#{run_id}/attempt_generation")
+    @redis.lpush("minitest/#{run_id}/attempt_generation", "wrong-type")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).size)
+  end
+
+  def test_retry_generation_clears_previous_fast_retry_markers
+    run_id = "test_retry_generation_clears_previous_fast_retry_markers"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    retry_set_key = "minitest/#{run_id}/retry_set"
+    @redis.sadd(retry_set_key, "old-stream-entry")
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    refute(@redis.sismember(retry_set_key, "old-stream-entry"))
+  end
+
   def test_retry_failed_build_with_consistently_failing_test
     worker1 = spawn_redis_worker(
       test_file: "failing_tests.rb",

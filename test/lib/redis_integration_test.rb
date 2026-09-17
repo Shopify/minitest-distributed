@@ -94,6 +94,7 @@ class RedisIntegrationTest < IntegrationTest
       arguments: {
         "--test-timeout" => "1",
         "--test-batch-size" => "5",
+        "--completion-grace" => "0.1",
       }.merge(arguments),
       timeout: timeout,
       env: env.merge("MINITEST_COORDINATOR" => @redis_uri),
