@@ -143,18 +143,34 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
 
   def test_completed_attempt_with_live_stream_is_taken_over_for_retry
     run_id = "test_completed_attempt_with_live_stream_is_taken_over_for_retry"
-    old_configuration = redis_configuration(run_id: run_id, worker_id: "old-worker")
+    old_configuration = Minitest::Distributed::Configuration.new(
+      coordinator_uri: URI(@redis_uri),
+      run_id: run_id,
+      worker_id: "old-worker",
+      key_ttl_seconds: 2,
+      completion_grace_seconds: 0.1,
+    )
     old_coordinator = T.cast(old_configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
     old_coordinator.produce(test_selector: empty_test_selector)
     old_generation = String(@redis.get("minitest/v3/#{run_id}/attempt_generation"))
     @redis.set("minitest/v3/#{run_id}/completed_at", (Time.now.to_f - 60).to_s)
+    @redis.set("minitest/v3/#{run_id}/retention_ttl", "4", ex: 4)
+    T.unsafe(old_coordinator).send(:cleanup)
+    assert(@redis.exists?("minitest/v3/#{run_id}/queue"), "short-TTL cleanup bypassed the retention fence")
 
-    new_configuration = redis_configuration(run_id: run_id, worker_id: "new-worker")
+    new_configuration = Minitest::Distributed::Configuration.new(
+      coordinator_uri: URI(@redis_uri),
+      run_id: run_id,
+      worker_id: "new-worker",
+      key_ttl_seconds: 4,
+      completion_grace_seconds: 0.1,
+    )
     new_coordinator = T.cast(new_configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
     new_coordinator.produce(test_selector: empty_test_selector)
     new_generation = String(@redis.get("minitest/v3/#{run_id}/attempt_generation"))
 
     refute_equal(old_generation, new_generation)
+    assert_equal("4", @redis.get("minitest/v3/#{run_id}/retention_ttl"))
     groups = @redis.xinfo("groups", "minitest/v3/#{run_id}/queue")
     assert_includes(groups.map { |group| group.fetch("name") }, "minitest-distributed-v3-#{new_generation}")
 

@@ -88,7 +88,10 @@ them to fail.
   retry runs more than a day later. Once these keys expire, a later invocation
   with the same run ID performs a full run rather than a selective retry. Do not
   set it below the duration of a run: required state expiring mid-run aborts the
-  run to avoid reporting incomplete results.
+  run to avoid reporting incomplete results. Active workers must use the same
+  TTL. A later retry may increase the retained run's TTL, but cannot decrease it
+  while that state exists, because doing so could invalidate another worker's
+  completion-grace wait.
 - `--stall-timeout=SECONDS` or `ENV[MINITEST_STALL_TIMEOUT_SECONDS]` (default:
   300, i.e. 5 minutes). After this long without processing a batch or observing
   the run counters change, inspect the Redis stream. If it has no pending or

@@ -287,6 +287,42 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(101, results.runs)
   end
 
+  def test_shorter_retry_cannot_reduce_an_overlapping_waiters_retention_ttl
+    run_id = "test_shorter_retry_cannot_reduce_an_overlapping_waiters_retention_ttl"
+    worker1 = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      arguments: { "--key-ttl" => "2", "--completion-grace" => "0.1" },
+    ).value
+    refute_worker_successful(worker1)
+
+    slow_retry_thread = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      timeout: 8,
+      arguments: { "--key-ttl" => "4", "--completion-grace" => "3" },
+    )
+    Timeout.timeout(2) do
+      sleep(0.01) until @redis.get("minitest/v3/#{run_id}/retention_ttl") == "4"
+    end
+
+    short_retry = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      arguments: { "--key-ttl" => "2", "--completion-grace" => "0.1" },
+    ).value
+    refute_worker_successful(short_retry)
+    assert_output_includes(short_retry, "rejected a Redis key TTL change")
+    assert_equal("4", @redis.get("minitest/v3/#{run_id}/retention_ttl"))
+
+    slow_retry = slow_retry_thread.value
+    refute_worker_successful(slow_retry)
+    results = combined_results(run_id: run_id)
+    assert_equal(1, results.size)
+    assert_equal(1, results.requeues)
+    assert_equal(101, results.runs)
+  end
+
   def test_retry_failed_build_with_consistently_failing_test
     worker1 = spawn_redis_worker(
       test_file: "failing_tests.rb",

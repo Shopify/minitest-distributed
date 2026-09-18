@@ -198,6 +198,40 @@ module Minitest
           assert_equal(1, max_active_scopes)
         end
 
+        def test_mutating_script_load_is_serialized_with_no_reconnect_scopes
+          load_started = Queue.new
+          release_load = Queue.new
+          entered_no_reconnect = Queue.new
+          fake_redis = Redis.allocate
+          fake_redis.define_singleton_method(:script) do |*_args|
+            load_started.push(true)
+            release_load.pop
+            "loaded-adjust-sha"
+          end
+          fake_redis.define_singleton_method(:without_reconnect) do |&block|
+            entered_no_reconnect.push(true)
+            block.call
+          end
+          fake_redis.define_singleton_method(:evalsha) { |*_args, **_kwargs| 0 }
+          T.unsafe(@coordinator).instance_variable_set(:@redis, fake_redis)
+          T.unsafe(@coordinator).instance_variable_set(:@heartbeat_script, "loaded-heartbeat-sha")
+
+          loading_thread = Thread.new do
+            T.unsafe(@coordinator).send(:execute_script, script_name: :adjust_results, keys: [], argv: [])
+          end
+          load_started.pop
+          heartbeat_thread = Thread.new do
+            T.unsafe(@coordinator).send(:execute_script, script_name: :heartbeat, keys: [], argv: [])
+          end
+          sleep(0.05)
+          entered_before_load_finished = !entered_no_reconnect.empty?
+          release_load.push(true)
+          loading_thread.join
+          heartbeat_thread.join
+
+          refute(entered_before_load_finished)
+        end
+
         def test_truncated_follower_skips_the_consumer_loop
           T.unsafe(@coordinator).instance_variable_set(:@truncated_follower, true)
           @coordinator.define_singleton_method(:claim_stale_runnables) { raise "consumer loop entered" }

@@ -104,6 +104,7 @@ module Minitest
           @combined_results_production_complete = T.let(nil, T.nilable(T::Boolean))
           @attempt_truncated = T.let(false, T::Boolean)
           @truncated_follower = T.let(false, T::Boolean)
+          @registration_rejected = T.let(false, T::Boolean)
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
@@ -181,6 +182,7 @@ module Minitest
             key("completed_at"),
             key("retry_snapshot_digest"),
             key("truncated_generation"),
+            key("retention_ttl"),
           )
           registration = T.let(nil, T.untyped)
           registration_mode = T.let(-1, Integer)
@@ -207,6 +209,14 @@ module Minitest
             if registration_mode == -3
               @aborted = true
               @truncated_follower = true
+            elsif registration_mode == -4
+              @aborted = true
+              @registration_rejected = true
+              emit_message(<<~ERROR)
+                ERROR: minitest-distributed rejected a Redis key TTL change for an existing run.
+                run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+                Active workers must use the same key TTL, and later retries cannot decrease the retained TTL.
+              ERROR
             end
             break unless registration_mode == -2
 
@@ -294,7 +304,7 @@ module Minitest
         # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
-          return if @truncated_follower
+          return if @truncated_follower || @registration_rejected
 
           exponential_backoff = INITIAL_BACKOFF
           last_progress_at = monotonic_time
@@ -571,9 +581,28 @@ module Minitest
             -- KEYS: stream, generation token, stalled, production_complete,
             -- production_heartbeat, retry_set, ten statistics, the
             -- skipped/failed/error lists, truncated, completed_at, then the
-            -- completed retry-snapshot digest and truncating generation.
+            -- completed retry-snapshot digest, truncating generation, and the
+            -- monotonic retained-state TTL.
             local max_safe_integer = 9007199254740991
             local invalid_active_state = false
+            local requested_ttl = tonumber(ARGV[2])
+            local retention_type = redis.call('TYPE', KEYS[24]).ok
+            local retained_ttl = nil
+            if retention_type == 'string' then
+              local validation = redis.pcall('INCRBY', KEYS[24], 0)
+              if type(validation) == 'table' and validation.err then
+                invalid_active_state = true
+              else
+                retained_ttl = tonumber(validation)
+                if not retained_ttl or retained_ttl <= 0 then
+                  invalid_active_state = true
+                elseif requested_ttl < retained_ttl then
+                  return {0, '', -4, {}, {}}
+                end
+              end
+            elseif retention_type ~= 'none' then
+              invalid_active_state = true
+            end
 
             local stream_type = redis.call('TYPE', KEYS[1]).ok
             local stream_exists = stream_type == 'stream'
@@ -678,18 +707,27 @@ module Minitest
             elseif existing_stat_count > 0 or production_complete then
               invalid_active_state = true
             end
+            if not retained_ttl and (stream_exists or current_generation or existing_stat_count > 0) then
+              invalid_active_state = true
+            end
 
             -- Active pre-production attempts are safe to join only after all
             -- retained state passes validation. Terminal attempts fall through
             -- to grace handling and fenced retry takeover below.
             if stream_exists and current_generation and not stalled and not invalid_active_state then
+              local terminal_complete = production_complete and existing_stat_count == 10 and
+                stat_values[9] == stat_values[10]
               if truncated and truncated_generation ~= current_generation then
+                if requested_ttl ~= retained_ttl then
+                  return {0, current_generation, -4, {}, {}}
+                end
                 -- A mode-3 replacement generation is already active. Join it as
                 -- an explicitly aborted follower instead of replacing its token.
                 return {0, current_generation, -3, {}, {}}
-              elseif not truncated and not (
-                production_complete and existing_stat_count == 10 and stat_values[9] == stat_values[10]
-              ) then
+              elseif not truncated and not terminal_complete then
+                if requested_ttl ~= retained_ttl then
+                  return {0, current_generation, -4, {}, {}}
+                end
                 return {0, current_generation, -1, {}, {}}
               end
             end
@@ -740,7 +778,7 @@ module Minitest
               -- not a genuinely new run ID. The generation token is excluded
               -- because it intentionally survives cleanup until the shared TTL.
               local auxiliary_count = redis.call(
-                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21], KEYS[22], KEYS[23]
+                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21], KEYS[22], KEYS[23], KEYS[24]
               )
               if auxiliary_count > 0 then
                 mode = 2
@@ -770,6 +808,7 @@ module Minitest
                   -- TTL than this retry invocation requests. Refresh every
                   -- validated retained key before sleeping so the snapshot
                   -- survives the full current grace period and safety margin.
+                  redis.call('SET', KEYS[24], requested_ttl, 'EX', requested_ttl)
                   for key_index = 1, #KEYS do
                     if redis.call('EXISTS', KEYS[key_index]) == 1 then
                       redis.call('EXPIRE', KEYS[key_index], ARGV[2])
@@ -805,6 +844,7 @@ module Minitest
 
             local generation = ARGV[4]
             redis.call('SET', KEYS[2], generation, 'EX', ARGV[2])
+            redis.call('SET', KEYS[24], requested_ttl, 'EX', requested_ttl)
             local group_name = ARGV[1] .. '-' .. generation
             redis.call('XGROUP', 'CREATE', KEYS[1], group_name, '0', 'MKSTREAM')
             redis.call('SET', KEYS[5], 0, 'EX', ARGV[2])
@@ -832,6 +872,14 @@ module Minitest
             elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
               return redis.error_reply('COORDINATORSTREAM missing or invalid stream')
             end
+            if redis.call('TYPE', KEYS[24]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
+            end
 
             local size = tonumber(ARGV[3])
             if not size or size < 0 or size % 1 ~= 0 or size > 9007199254740991 then
@@ -851,6 +899,7 @@ module Minitest
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             redis.call('EXPIRE', KEYS[2], ARGV[2])
             redis.call('EXPIRE', KEYS[5], ARGV[2])
+            redis.call('EXPIRE', KEYS[24], ARGV[2])
             return reply
           LUA
         end
@@ -896,6 +945,14 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing required key ' .. KEYS[19])
             elseif current_generation ~= expected_generation then
               return redis.error_reply('STALEATTEMPT expected generation ' .. expected_generation)
+            end
+            if redis.call('TYPE', KEYS[24]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
             if redis.call('TYPE', KEYS[1]).ok ~= 'stream' then
@@ -1087,6 +1144,14 @@ module Minitest
             elseif current_generation ~= ARGV[1] then
               return redis.error_reply('STALEATTEMPT expected generation ' .. ARGV[1])
             end
+            if redis.call('TYPE', KEYS[24]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
+            end
 
             local stream_type = redis.call('TYPE', KEYS[2]).ok
             local retry_type = redis.call('TYPE', KEYS[3]).ok
@@ -1165,6 +1230,14 @@ module Minitest
               return redis.error_reply('STALEATTEMPT expected generation ' .. ARGV[1])
             elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
               return redis.error_reply('COORDINATORSTREAM missing or invalid key ' .. KEYS[2])
+            end
+            if redis.call('TYPE', KEYS[11]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[11], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
             local groups = redis.pcall('XINFO', 'GROUPS', KEYS[2])
@@ -1271,6 +1344,14 @@ module Minitest
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
             end
+            if redis.call('TYPE', KEYS[3]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[3], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
+            end
             local heartbeat_type = redis.call('TYPE', KEYS[2]).ok
             if heartbeat_type ~= 'none' and heartbeat_type ~= 'string' then
               return redis.error_reply('COORDINATORSTATE invalid key type ' .. KEYS[2])
@@ -1278,6 +1359,7 @@ module Minitest
             redis.call('INCR', KEYS[2])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             redis.call('EXPIRE', KEYS[2], ARGV[2])
+            redis.call('EXPIRE', KEYS[3], ARGV[2])
             return 1
           LUA
         end
@@ -1291,6 +1373,14 @@ module Minitest
             local current_generation = redis.call('GET', KEYS[1])
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
+            end
+            if redis.call('TYPE', KEYS[7]).ok ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE missing retention TTL')
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[7], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
             local production_type = redis.call('TYPE', KEYS[3]).ok
@@ -1326,6 +1416,7 @@ module Minitest
             redis.call('SET', KEYS[2], 1, 'EX', ARGV[2])
             redis.call('SET', KEYS[6], current_generation, 'EX', ARGV[2])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
+            redis.call('EXPIRE', KEYS[7], ARGV[2])
             return 1
           LUA
         end
@@ -1340,7 +1431,17 @@ module Minitest
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
             end
+            if redis.call('TYPE', KEYS[3]).ok ~= 'string' then
+              return 0
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[3], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[3]) then
+              return 0
+            end
 
+            redis.call('EXPIRE', KEYS[2], ARGV[3])
+            redis.call('EXPIRE', KEYS[3], ARGV[3])
             redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
             redis.call('DEL', KEYS[1])
             return 1
@@ -1358,12 +1459,39 @@ module Minitest
               return 0
             end
 
+            if redis.call('TYPE', KEYS[4]).ok ~= 'string' then
+              return 0
+            end
+            local retention_validation = redis.pcall('INCRBY', KEYS[4], 0)
+            if (type(retention_validation) == 'table' and retention_validation.err) or
+              tonumber(retention_validation) ~= tonumber(ARGV[3]) then
+              return 0
+            end
+
             redis.call('EXPIRE', KEYS[2], ARGV[3])
+            redis.call('EXPIRE', KEYS[4], ARGV[3])
             redis.call('SET', KEYS[3], 1, 'EX', ARGV[3])
             redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
             redis.call('DEL', KEYS[1])
             return 1
           LUA
+        end
+
+        sig { params(script_name: Symbol).returns(String) }
+        def resolve_script(script_name)
+          case script_name
+          when :register_consumergroup then register_consumergroup_script
+          when :read_results then read_results_script
+          when :reset_results then reset_results_script
+          when :commit_results then commit_results_script
+          when :cleanup then cleanup_script
+          when :abort then abort_script
+          when :adjust_results then adjust_results_script
+          when :publish_tests then publish_tests_script
+          when :heartbeat then heartbeat_script
+          when :mark_attempt_state then mark_attempt_state_script
+          else raise ArgumentError, "Unknown Redis script: #{script_name}"
+          end
         end
 
         sig do
@@ -1376,27 +1504,15 @@ module Minitest
         def execute_script(script_name:, keys:, argv:)
           attempts = T.let(0, Integer)
           begin
-            script_sha = case script_name
-            when :register_consumergroup then register_consumergroup_script
-            when :read_results then read_results_script
-            when :reset_results then reset_results_script
-            when :commit_results then commit_results_script
-            when :cleanup then cleanup_script
-            when :abort then abort_script
-            when :adjust_results then adjust_results_script
-            when :publish_tests then publish_tests_script
-            when :heartbeat then heartbeat_script
-            when :mark_attempt_state then mark_attempt_state_script
-            else raise ArgumentError, "Unknown Redis script: #{script_name}"
-            end
             if script_name == :read_results
-              redis.evalsha(script_sha, keys: keys, argv: argv)
+              redis.evalsha(resolve_script(script_name), keys: keys, argv: argv)
             else
-              # redis-rb retries commands after reconnect by default. A response
-              # can be lost after Redis executes EVALSHA, so transparently
-              # replaying a mutating script can duplicate counters or stream
-              # entries. NOSCRIPT remains the only manually retried error below.
+              # Script loading and EVALSHA share one serialized no-reconnect
+              # scope. redis-rb toggles reconnect state outside its command
+              # monitor, so resolving the SHA before taking this mutex could let
+              # the heartbeat invalidate a producer's pending SCRIPT LOAD.
               @mutating_script_mutex.synchronize do
+                script_sha = resolve_script(script_name)
                 redis.without_reconnect do
                   redis.evalsha(script_sha, keys: keys, argv: argv)
                 end
@@ -1590,6 +1706,7 @@ module Minitest
                 list_key(ResultType::Failed.serialize),
                 list_key(ResultType::Error.serialize),
                 key("retry_snapshot_digest"),
+                key("retention_ttl"),
               ],
               argv: argv,
             )
@@ -1608,6 +1725,7 @@ module Minitest
               key("acks"),
               key("size"),
               key("truncated_generation"),
+              key("retention_ttl"),
             ],
             argv: [generation, configuration.key_ttl_seconds],
           )
@@ -1632,7 +1750,7 @@ module Minitest
               begin
                 updated = execute_script(
                   script_name: :heartbeat,
-                  keys: [key("attempt_generation"), key("production_heartbeat")],
+                  keys: [key("attempt_generation"), key("production_heartbeat"), key("retention_ttl")],
                   argv: [generation, configuration.key_ttl_seconds],
                 )
                 break unless updated == 1
@@ -1847,7 +1965,7 @@ module Minitest
           generation = T.must(@attempt_generation)
           applied = execute_script(
             script_name: :abort,
-            keys: [stream_key, key("attempt_generation"), key("stalled")],
+            keys: [stream_key, key("attempt_generation"), key("stalled"), key("retention_ttl")],
             argv: [generation, group_name, configuration.key_ttl_seconds],
           )
           return if applied != 1 && attempt_superseded?
@@ -1919,8 +2037,8 @@ module Minitest
           generation = T.must(@attempt_generation)
           execute_script(
             script_name: :cleanup,
-            keys: [stream_key, key("attempt_generation")],
-            argv: [generation, group_name],
+            keys: [stream_key, key("attempt_generation"), key("retention_ttl")],
+            argv: [generation, group_name, configuration.key_ttl_seconds],
           )
         end
 
@@ -1975,7 +2093,12 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.push(key("completed_at"), key("retry_snapshot_digest"), key("truncated_generation"))
+          keys.push(
+            key("completed_at"),
+            key("retry_snapshot_digest"),
+            key("truncated_generation"),
+            key("retention_ttl"),
+          )
           updated = execute_script(
             script_name: :reset_results,
             keys: keys,
@@ -2004,7 +2127,12 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.push(key("completed_at"), key("retry_snapshot_digest"), key("truncated_generation"))
+          keys.push(
+            key("completed_at"),
+            key("retry_snapshot_digest"),
+            key("truncated_generation"),
+            key("retention_ttl"),
+          )
           argv = [
             generation,
             configuration.key_ttl_seconds,
@@ -2067,6 +2195,7 @@ module Minitest
             key("completed_at"),
             key("retry_snapshot_digest"),
             key("truncated_generation"),
+            key("retention_ttl"),
           )
 
           response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
