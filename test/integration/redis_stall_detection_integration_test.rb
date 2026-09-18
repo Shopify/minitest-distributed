@@ -155,8 +155,8 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     old_generation = String(@redis.get("minitest/v3/#{run_id}/attempt_generation"))
     @redis.set("minitest/v3/#{run_id}/completed_at", (Time.now.to_f - 60).to_s)
     @redis.set("minitest/v3/#{run_id}/retention_ttl", "4", ex: 4)
-    T.unsafe(old_coordinator).send(:cleanup)
-    assert(@redis.exists?("minitest/v3/#{run_id}/queue"), "short-TTL cleanup bypassed the retention fence")
+    T.unsafe(old_coordinator).send(:commit_results, [])
+    assert_operator(@redis.ttl("minitest/v3/#{run_id}/acks"), :>, 2)
 
     new_configuration = Minitest::Distributed::Configuration.new(
       coordinator_uri: URI(@redis_uri),

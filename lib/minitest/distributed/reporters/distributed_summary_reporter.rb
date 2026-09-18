@@ -24,6 +24,13 @@ module Minitest
         def report
           print_discard_warning if local_results.discards > 0
 
+          if registration_rejected?
+            formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
+            io.puts("This worker: #{local_results} #{formatted_duration}")
+            io.puts("Combined results are unavailable because coordinator registration was rejected.")
+            return
+          end
+
           if configuration.coordinator.aborted?
             if coordinator_stalled?
               formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
@@ -70,6 +77,12 @@ module Minitest
             take too long to run. Make sure that all your tests complete well within #{configuration.test_timeout_seconds}s.
 
           WARNING
+        end
+
+        sig { returns(T::Boolean) }
+        def registration_rejected?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:registration_rejected?) && !!coordinator.registration_rejected?
         end
 
         sig { returns(T::Boolean) }

@@ -313,6 +313,8 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     ).value
     refute_worker_successful(short_retry)
     assert_output_includes(short_retry, "rejected a Redis key TTL change")
+    assert_output_includes(short_retry, "coordinator registration was rejected")
+    refute_includes(short_retry.stdout, "Cannot retry a run that was cut short")
     assert_equal("4", @redis.get("minitest/v3/#{run_id}/retention_ttl"))
 
     slow_retry = slow_retry_thread.value

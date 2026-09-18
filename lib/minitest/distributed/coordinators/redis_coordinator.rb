@@ -162,6 +162,11 @@ module Minitest
           !stall_diagnostic.nil?
         end
 
+        sig { returns(T::Boolean) }
+        def registration_rejected?
+          @registration_rejected
+        end
+
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
           production_heartbeat_thread = T.let(nil, T.nilable(Thread))
@@ -866,7 +871,7 @@ module Minitest
           @reset_results_script ||= redis.script(:load, <<~LUA)
             -- KEYS match adjust_results_script: generation, stream, retry_set,
             -- control markers, ten statistics, three result lists, completed_at,
-            -- retry_snapshot_digest, and truncated_generation.
+            -- retry_snapshot_digest, truncated_generation, and retention_ttl.
             if redis.call('TYPE', KEYS[1]).ok ~= 'string' or redis.call('GET', KEYS[1]) ~= ARGV[1] then
               return redis.error_reply('STALEATTEMPT missing or mismatched generation')
             elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
@@ -876,8 +881,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
@@ -893,13 +899,13 @@ module Minitest
             local reply = {}
             for stat_index = 1, 10 do
               local value = stat_index == 10 and size or 0
-              redis.call('SET', KEYS[stat_index + 7], value, 'EX', ARGV[2])
+              redis.call('SET', KEYS[stat_index + 7], value, 'EX', effective_ttl)
               reply[stat_index] = value
             end
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
-            redis.call('EXPIRE', KEYS[2], ARGV[2])
-            redis.call('EXPIRE', KEYS[5], ARGV[2])
-            redis.call('EXPIRE', KEYS[24], ARGV[2])
+            redis.call('EXPIRE', KEYS[1], effective_ttl)
+            redis.call('EXPIRE', KEYS[2], effective_ttl)
+            redis.call('EXPIRE', KEYS[5], effective_ttl)
+            redis.call('EXPIRE', KEYS[24], effective_ttl)
             return reply
           LUA
         end
@@ -950,8 +956,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
@@ -1037,6 +1044,9 @@ module Minitest
               end
               truncated_reply[result_count + 11] = production_complete and 1 or 0
               truncated_reply[result_count + 12] = 1
+              for key_index = 1, #KEYS do
+                redis.call('EXPIRE', KEYS[key_index], effective_ttl)
+              end
               return truncated_reply
             end
 
@@ -1117,15 +1127,15 @@ module Minitest
             if updated_acks == updated_size and production_complete then
               local redis_time = redis.call('TIME')
               local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
-              redis.call('SET', KEYS[21], completed_at, 'EX', ARGV[2])
+              redis.call('SET', KEYS[21], completed_at, 'EX', effective_ttl)
               local digest = retry_snapshot_digest(KEYS[14], KEYS[15])
-              redis.call('SET', KEYS[22], digest, 'EX', ARGV[2])
+              redis.call('SET', KEYS[22], digest, 'EX', effective_ttl)
             end
             reply[result_count + 11] = production_complete and 1 or 0
             reply[result_count + 12] = 0
 
             for key_index = 1, #KEYS do
-              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+              redis.call('EXPIRE', KEYS[key_index], effective_ttl)
             end
 
             return reply
@@ -1148,8 +1158,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[24], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
@@ -1211,7 +1222,7 @@ module Minitest
               reply[stat_index] = redis.call('INCRBY', KEYS[stat_index + 7], ARGV[stat_index + 4])
             end
             for key_index = 1, #KEYS do
-              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+              redis.call('EXPIRE', KEYS[key_index], effective_ttl)
             end
             return reply
           LUA
@@ -1235,8 +1246,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[11], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
@@ -1315,17 +1327,17 @@ module Minitest
               argument_index = argument_index + 2
             end
             if ARGV[3] == '1' then
-              redis.call('SET', KEYS[3], 1, 'EX', ARGV[2])
+              redis.call('SET', KEYS[3], 1, 'EX', effective_ttl)
               if acks == size then
                 local redis_time = redis.call('TIME')
                 local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
-                redis.call('SET', KEYS[7], completed_at, 'EX', ARGV[2])
+                redis.call('SET', KEYS[7], completed_at, 'EX', effective_ttl)
                 local digest = retry_snapshot_digest(KEYS[8], KEYS[9])
-                redis.call('SET', KEYS[10], digest, 'EX', ARGV[2])
+                redis.call('SET', KEYS[10], digest, 'EX', effective_ttl)
               end
             end
             for key_index = 1, #KEYS do
-              redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+              redis.call('EXPIRE', KEYS[key_index], effective_ttl)
             end
             return test_count
           LUA
@@ -1348,8 +1360,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[3], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
             local heartbeat_type = redis.call('TYPE', KEYS[2]).ok
@@ -1357,9 +1370,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE invalid key type ' .. KEYS[2])
             end
             redis.call('INCR', KEYS[2])
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
-            redis.call('EXPIRE', KEYS[2], ARGV[2])
-            redis.call('EXPIRE', KEYS[3], ARGV[2])
+            redis.call('EXPIRE', KEYS[1], effective_ttl)
+            redis.call('EXPIRE', KEYS[2], effective_ttl)
+            redis.call('EXPIRE', KEYS[3], effective_ttl)
             return 1
           LUA
         end
@@ -1378,8 +1391,9 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE missing retention TTL')
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[7], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[2]) then
+              not effective_ttl or tonumber(ARGV[2]) > effective_ttl then
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
@@ -1413,10 +1427,10 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE invalid production marker type')
             end
 
-            redis.call('SET', KEYS[2], 1, 'EX', ARGV[2])
-            redis.call('SET', KEYS[6], current_generation, 'EX', ARGV[2])
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
-            redis.call('EXPIRE', KEYS[7], ARGV[2])
+            redis.call('SET', KEYS[2], 1, 'EX', effective_ttl)
+            redis.call('SET', KEYS[6], current_generation, 'EX', effective_ttl)
+            redis.call('EXPIRE', KEYS[1], effective_ttl)
+            redis.call('EXPIRE', KEYS[7], effective_ttl)
             return 1
           LUA
         end
@@ -1435,13 +1449,14 @@ module Minitest
               return 0
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[3], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[3]) then
+              not effective_ttl or tonumber(ARGV[3]) > effective_ttl then
               return 0
             end
 
-            redis.call('EXPIRE', KEYS[2], ARGV[3])
-            redis.call('EXPIRE', KEYS[3], ARGV[3])
+            redis.call('EXPIRE', KEYS[2], effective_ttl)
+            redis.call('EXPIRE', KEYS[3], effective_ttl)
             redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
             redis.call('DEL', KEYS[1])
             return 1
@@ -1463,14 +1478,15 @@ module Minitest
               return 0
             end
             local retention_validation = redis.pcall('INCRBY', KEYS[4], 0)
+            local effective_ttl = tonumber(retention_validation)
             if (type(retention_validation) == 'table' and retention_validation.err) or
-              tonumber(retention_validation) ~= tonumber(ARGV[3]) then
+              not effective_ttl or tonumber(ARGV[3]) > effective_ttl then
               return 0
             end
 
-            redis.call('EXPIRE', KEYS[2], ARGV[3])
-            redis.call('EXPIRE', KEYS[4], ARGV[3])
-            redis.call('SET', KEYS[3], 1, 'EX', ARGV[3])
+            redis.call('EXPIRE', KEYS[2], effective_ttl)
+            redis.call('EXPIRE', KEYS[4], effective_ttl)
+            redis.call('SET', KEYS[3], 1, 'EX', effective_ttl)
             redis.pcall('XGROUP', 'DESTROY', KEYS[1], ARGV[2])
             redis.call('DEL', KEYS[1])
             return 1
