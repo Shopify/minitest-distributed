@@ -85,6 +85,8 @@ module Minitest
 
           @redis = T.let(nil, T.nilable(Redis))
           @register_consumergroup_script = T.let(nil, T.nilable(String))
+          @read_results_script = T.let(nil, T.nilable(String))
+          @reset_results_script = T.let(nil, T.nilable(String))
           @commit_results_script = T.let(nil, T.nilable(String))
           @cleanup_script = T.let(nil, T.nilable(String))
           @abort_script = T.let(nil, T.nilable(String))
@@ -95,10 +97,10 @@ module Minitest
           @stream_key = T.let(key("queue"), String)
           @group_name = T.let(BASE_GROUP_NAME, String)
           @attempt_generation = T.let(nil, T.nilable(String))
-          @production_complete = T.let(false, T::Boolean)
           @production_heartbeat_error = T.let(nil, T.nilable(StandardError))
           @local_results = T.let(ResultAggregate.new, ResultAggregate)
           @combined_results = T.let(nil, T.nilable(ResultAggregate))
+          @combined_results_production_complete = T.let(nil, T.nilable(T::Boolean))
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
@@ -115,36 +117,31 @@ module Minitest
         sig { override.returns(ResultAggregate) }
         def combined_results
           @combined_results ||= begin
-            stats_as_string = redis.mget(
-              key("runs"),
-              key("assertions"),
-              key("passes"),
-              key("failures"),
-              key("errors"),
-              key("skips"),
-              key("requeues"),
-              key("discards"),
-              key("acks"),
-              key("size"),
+            keys = STATS_KEY_NAMES.map { |name| key(name) }
+            keys << key("production_complete")
+            response = T.cast(
+              execute_script(script_name: :read_results, keys: keys, argv: []),
+              T::Array[T.untyped],
             )
+            @combined_results_production_complete = response.fetch(0) == 1
+            stats_as_string = response.drop(1)
 
             ResultAggregate.new(
               max_failures: configuration.max_failures,
 
-              runs: Integer(stats_as_string.fetch(0) || 0),
-              assertions: Integer(stats_as_string.fetch(1) || 0),
-              passes: Integer(stats_as_string.fetch(2) || 0),
-              failures: Integer(stats_as_string.fetch(3) || 0),
-              errors: Integer(stats_as_string.fetch(4) || 0),
-              skips: Integer(stats_as_string.fetch(5) || 0),
-              requeues: Integer(stats_as_string.fetch(6) || 0),
-              discards: Integer(stats_as_string.fetch(7) || 0),
-              acks: Integer(stats_as_string.fetch(8) || 0),
+              runs: Integer(stats_as_string.fetch(0).then { |value| value == "" ? 0 : value }),
+              assertions: Integer(stats_as_string.fetch(1).then { |value| value == "" ? 0 : value }),
+              passes: Integer(stats_as_string.fetch(2).then { |value| value == "" ? 0 : value }),
+              failures: Integer(stats_as_string.fetch(3).then { |value| value == "" ? 0 : value }),
+              errors: Integer(stats_as_string.fetch(4).then { |value| value == "" ? 0 : value }),
+              skips: Integer(stats_as_string.fetch(5).then { |value| value == "" ? 0 : value }),
+              requeues: Integer(stats_as_string.fetch(6).then { |value| value == "" ? 0 : value }),
+              discards: Integer(stats_as_string.fetch(7).then { |value| value == "" ? 0 : value }),
+              acks: Integer(stats_as_string.fetch(8).then { |value| value == "" ? 0 : value }),
 
-              # In the case where we have no build size number published yet, we initialize
-              # thesize of the test suite to be arbitrarity large, to make sure it is
-              # higher than the number of acks, so the run is not consider completed yet.
-              size: Integer(stats_as_string.fetch(9) || 2_147_483_647),
+              # Before the producer initializes counters, a sentinel prevents the
+              # absent size from making an unpublished run appear complete.
+              size: Integer(stats_as_string.fetch(9).then { |value| value == "" ? 2_147_483_647 : value }),
             )
           end
         rescue ArgumentError, TypeError => parse_error
@@ -176,11 +173,11 @@ module Minitest
           ]
           registration_keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           registration_keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          registration_keys.push(key("truncated"), key("completed_at"))
+          registration_keys.push(key("truncated"), key("completed_at"), key("retry_snapshot_digest"))
           registration = T.let(nil, T.untyped)
           registration_mode = T.let(-1, Integer)
           leader = T.let(false, T::Boolean)
-          ignore_completion_grace = T.let(false, T::Boolean)
+          awaited_generation = T.let(nil, T.nilable(String))
           loop do
             registration = T.unsafe(execute_script(
               script_name: :register_consumergroup,
@@ -191,7 +188,7 @@ module Minitest
                 configuration.max_failures || "",
                 SecureRandom.uuid,
                 configuration.completion_grace_seconds,
-                ignore_completion_grace ? 1 : 0,
+                awaited_generation || "",
               ],
             ))
 
@@ -202,7 +199,7 @@ module Minitest
             break unless registration_mode == -2
 
             sleep(Float(registration.fetch(5)))
-            ignore_completion_grace = true
+            awaited_generation = String(registration.fetch(1))
           end
           return unless leader
 
@@ -221,19 +218,29 @@ module Minitest
               tests_from_selector
             when 1 # Valid completed attempt; use selective retry behavior.
               if configuration.retry_failures
-                total_failures = previous_failures.length + previous_errors.length
-                adjust_combined_results(
-                  ResultAggregate.new(
-                    size: total_failures,
-                    failures: -previous_failures.length,
-                    errors: -previous_errors.length,
-                    requeues: total_failures,
-                  ),
-                  clear_retry_lists: true,
-                )
-
                 test_identifiers_to_retry = T.let(previous_failures + previous_errors, T::Array[String])
-                test_identifiers_to_retry.map { |identifier| DefinedRunnable.from_identifier(identifier) }
+                retry_tests = materialize_retry_tests(test_identifiers_to_retry)
+                if retry_tests
+                  total_failures = retry_tests.length
+                  adjust_combined_results(
+                    ResultAggregate.new(
+                      size: total_failures,
+                      failures: -previous_failures.length,
+                      errors: -previous_errors.length,
+                      requeues: total_failures,
+                    ),
+                    clear_retry_lists: true,
+                  )
+                  retry_tests
+                else
+                  emit_message(<<~WARNING)
+                    WARNING: The previous attempt retained an invalid retry identifier.
+                    Running the full test suite instead of a selective retry.
+                  WARNING
+                  tests_from_selector = test_selector.tests
+                  reset_combined_results_for_full_rerun(size: tests_from_selector.size)
+                  tests_from_selector
+                end
               else
                 adjust_combined_results(ResultAggregate.new(size: 0))
                 []
@@ -427,6 +434,7 @@ module Minitest
         rescue Redis::CommandError => ce
           coordinator_state_error = ce.message.start_with?(
             "NOGROUP",
+            "WRONGTYPE",
             "COORDINATORSTATE",
             "COORDINATORSTREAM",
             "STALEATTEMPT",
@@ -480,29 +488,127 @@ module Minitest
         end
 
         sig { returns(String) }
+        def read_results_script
+          @read_results_script ||= redis.script(:load, <<~LUA)
+            -- KEYS: ten statistics followed by production_complete.
+            local max_safe_integer = 9007199254740991
+            local production_type = redis.call('TYPE', KEYS[11]).ok
+            local production_complete = false
+            if production_type == 'string' then
+              if redis.call('GET', KEYS[11]) ~= '1' then
+                return redis.error_reply('COORDINATORSTATE invalid production_complete marker')
+              end
+              production_complete = true
+            elseif production_type ~= 'none' then
+              return redis.error_reply('COORDINATORSTATE invalid production_complete type')
+            end
+
+            local values = {}
+            local existing_count = 0
+            for stat_index = 1, 10 do
+              local stat_type = redis.call('TYPE', KEYS[stat_index]).ok
+              if stat_type == 'none' then
+                if production_complete then
+                  return redis.error_reply('COORDINATORSTATE missing terminal statistic ' .. KEYS[stat_index])
+                end
+                values[stat_index] = ''
+              elseif stat_type ~= 'string' then
+                return redis.error_reply('COORDINATORSTATE invalid statistic type ' .. KEYS[stat_index])
+              else
+                local validation = redis.pcall('INCRBY', KEYS[stat_index], 0)
+                if type(validation) == 'table' and validation.err then
+                  return redis.error_reply('COORDINATORSTATE invalid statistic ' .. KEYS[stat_index])
+                end
+                local value = tonumber(validation)
+                if not value or value < 0 or value > max_safe_integer then
+                  return redis.error_reply('COORDINATORSTATE unsafe statistic ' .. KEYS[stat_index])
+                end
+                values[stat_index] = value
+                existing_count = existing_count + 1
+              end
+            end
+
+            if existing_count == 10 then
+              local runs = values[1]
+              local reported = values[3] + values[4] + values[5] + values[6]
+              if values[9] > values[10] or runs < values[7] + values[8] or
+                runs - values[7] - values[8] ~= reported then
+                return redis.error_reply('COORDINATORSTATE inconsistent aggregate statistics')
+              end
+            end
+
+            local reply = {production_complete and 1 or 0}
+            for stat_index = 1, 10 do
+              if values[stat_index] == '' then
+                reply[#reply + 1] = ''
+              else
+                reply[#reply + 1] = values[stat_index]
+              end
+            end
+            return reply
+          LUA
+        end
+
+        sig { returns(String) }
         def register_consumergroup_script
           @register_consumergroup_script ||= redis.script(:load, <<~LUA)
             -- KEYS: stream, generation token, stalled, production_complete,
             -- production_heartbeat, retry_set, ten statistics, the
-            -- skipped/failed/error lists, truncated, then completed_at.
-            local stream_exists = redis.call('EXISTS', KEYS[1]) == 1
+            -- skipped/failed/error lists, truncated, completed_at, then the
+            -- completed retry-snapshot digest.
+            local max_safe_integer = 9007199254740991
+            local invalid_active_state = false
+
+            local stream_type = redis.call('TYPE', KEYS[1]).ok
+            local stream_exists = stream_type == 'stream'
+            if stream_type ~= 'none' and stream_type ~= 'stream' then
+              invalid_active_state = true
+            end
+
             local generation_type = redis.call('TYPE', KEYS[2]).ok
             local current_generation = nil
-            local invalid_active_state = false
             if generation_type == 'string' then
               current_generation = redis.call('GET', KEYS[2])
             elseif generation_type ~= 'none' then
               invalid_active_state = true
             end
-            local stalled = redis.call('EXISTS', KEYS[3]) == 1
-            local truncated = redis.call('EXISTS', KEYS[20]) == 1
-            local production_complete_type = redis.call('TYPE', KEYS[4]).ok
-            if production_complete_type ~= 'none' and production_complete_type ~= 'string' then
-              invalid_active_state = true
-            elseif production_complete_type == 'string' and redis.call('GET', KEYS[4]) ~= '1' then
+
+            local function read_marker(key)
+              local marker_type = redis.call('TYPE', key).ok
+              if marker_type == 'none' then
+                return false, false
+              elseif marker_type == 'string' and redis.call('GET', key) == '1' then
+                return true, false
+              end
+              return false, true
+            end
+
+            local stalled, stalled_invalid = read_marker(KEYS[3])
+            local production_complete, production_complete_invalid = read_marker(KEYS[4])
+            local truncated, truncated_invalid = read_marker(KEYS[20])
+            if stalled_invalid or production_complete_invalid or truncated_invalid then
               invalid_active_state = true
             end
-            local max_safe_integer = 9007199254740991
+
+            local heartbeat_type = redis.call('TYPE', KEYS[5]).ok
+            if heartbeat_type ~= 'none' and heartbeat_type ~= 'string' then
+              invalid_active_state = true
+            end
+
+            local function retry_snapshot_digest(failed, errors)
+              local pieces = {'failures', tostring(#failed)}
+              for _, identifier in ipairs(failed) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              pieces[#pieces + 1] = 'errors'
+              pieces[#pieces + 1] = tostring(#errors)
+              for _, identifier in ipairs(errors) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              return redis.sha1hex(table.concat(pieces, string.char(0)))
+            end
 
             local function read_safe_integer(key)
               if redis.call('TYPE', key).ok ~= 'string' then
@@ -513,7 +619,7 @@ module Minitest
                 return nil
               end
               local value = tonumber(validation)
-              if not value or math.abs(value) > max_safe_integer then
+              if not value or value < 0 or value > max_safe_integer then
                 return nil
               end
               return value
@@ -524,38 +630,33 @@ module Minitest
               required_stats[#required_stats + 1] = KEYS[key_index]
             end
             local existing_stat_count = redis.call('EXISTS', unpack(required_stats))
-
-            -- An active attempt has both a stream and a generation token. A
-            -- production-complete 0/0 or fully-acked stream is terminal even if
-            -- its last worker died before cleanup; let the normal retry snapshot
-            -- path take ownership instead of joining it as an empty follower.
-            if stream_exists and current_generation and not stalled then
-              local completed = false
-              local invalid_terminal_counters = false
-              if existing_stat_count == 10 and redis.call('EXISTS', KEYS[4]) == 1 then
-                local acks = read_safe_integer(KEYS[15])
-                local size = read_safe_integer(KEYS[16])
-                invalid_terminal_counters = not acks or not size
-                completed = not invalid_terminal_counters and acks == size
-              end
-
-              if completed then
-                local completed_at = nil
-                if redis.call('TYPE', KEYS[21]).ok == 'string' then
-                  completed_at = tonumber(redis.call('GET', KEYS[21]))
-                end
-                if completed_at then
-                  local redis_time = redis.call('TIME')
-                  local now = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
-                  if now - completed_at < tonumber(ARGV[5]) then
-                    return {0, current_generation, -1, {}, {}}
-                  end
+            local stat_values = {}
+            if existing_stat_count == 10 then
+              for key_index = 7, 16 do
+                local value = read_safe_integer(KEYS[key_index])
+                if value == nil then
+                  invalid_active_state = true
                 else
+                  stat_values[#stat_values + 1] = value
+                end
+              end
+              if not invalid_active_state then
+                local runs = stat_values[1]
+                local reported = stat_values[3] + stat_values[4] + stat_values[5] + stat_values[6]
+                if stat_values[9] > stat_values[10] or runs < stat_values[7] + stat_values[8] or
+                  runs - stat_values[7] - stat_values[8] ~= reported then
                   invalid_active_state = true
                 end
-              elseif invalid_terminal_counters then
-                invalid_active_state = true
-              else
+              end
+            elseif existing_stat_count > 0 or production_complete then
+              invalid_active_state = true
+            end
+
+            -- Active pre-production attempts are safe to join only after all
+            -- retained state passes validation. Terminal attempts fall through
+            -- to grace handling and fenced retry takeover below.
+            if stream_exists and current_generation and not stalled and not invalid_active_state then
+              if not (production_complete and existing_stat_count == 10 and stat_values[9] == stat_values[10]) then
                 return {0, current_generation, -1, {}, {}}
               end
             end
@@ -567,56 +668,37 @@ module Minitest
             if stalled or invalid_active_state then
               mode = 2 -- fail-closed full rerun
             elseif existing_stat_count == 10 then
-              local stat_values = {}
-              local numeric_stats = true
-              for key_index = 7, 16 do
-                local value = read_safe_integer(KEYS[key_index])
-                if not value then
-                  numeric_stats = false
+              local failures = stat_values[4]
+              local errors = stat_values[5]
+              local acks = stat_values[9]
+              local size = stat_values[10]
+
+              if truncated then
+                mode = 3 -- intentionally aborted at max_failures
+              elseif acks == size and production_complete then
+                local retry_set_type = redis.call('TYPE', KEYS[6]).ok
+                local skipped_list_type = redis.call('TYPE', KEYS[17]).ok
+                local failed_list_type = redis.call('TYPE', KEYS[18]).ok
+                local error_list_type = redis.call('TYPE', KEYS[19]).ok
+                local digest_type = redis.call('TYPE', KEYS[22]).ok
+                if (retry_set_type ~= 'none' and retry_set_type ~= 'set') or
+                  (skipped_list_type ~= 'none' and skipped_list_type ~= 'list') or
+                  (failed_list_type ~= 'none' and failed_list_type ~= 'list') or
+                  (error_list_type ~= 'none' and error_list_type ~= 'list') or digest_type ~= 'string' then
+                  mode = 2
                 else
-                  stat_values[#stat_values + 1] = value
-                end
-              end
-
-              if not numeric_stats then
-                mode = 2
-              else
-                local failures = stat_values[4]
-                local errors = stat_values[5]
-                local acks = stat_values[9]
-                local size = stat_values[10]
-                local max_failures = tonumber(ARGV[3])
-
-                if truncated then
-                  mode = 3 -- intentionally aborted at max_failures
-                elseif acks == size then
-                  if redis.call('EXISTS', KEYS[4]) == 0 then
+                  previous_failures = redis.call('LRANGE', KEYS[18], 0, -1)
+                  previous_errors = redis.call('LRANGE', KEYS[19], 0, -1)
+                  local expected_digest = redis.call('GET', KEYS[22])
+                  local actual_digest = retry_snapshot_digest(previous_failures, previous_errors)
+                  if #previous_failures ~= failures or #previous_errors ~= errors or expected_digest ~= actual_digest then
                     mode = 2
                   else
-                    local retry_set_type = redis.call('TYPE', KEYS[6]).ok
-                    local skipped_list_type = redis.call('TYPE', KEYS[17]).ok
-                    local failed_list_type = redis.call('TYPE', KEYS[18]).ok
-                    local error_list_type = redis.call('TYPE', KEYS[19]).ok
-                    if (retry_set_type ~= 'none' and retry_set_type ~= 'set') or
-                      (skipped_list_type ~= 'none' and skipped_list_type ~= 'list') or
-                      (failed_list_type ~= 'none' and failed_list_type ~= 'list') or
-                      (error_list_type ~= 'none' and error_list_type ~= 'list') then
-                      mode = 2
-                    else
-                      previous_failures = redis.call('LRANGE', KEYS[18], 0, -1)
-                      previous_errors = redis.call('LRANGE', KEYS[19], 0, -1)
-                      if #previous_failures ~= failures or #previous_errors ~= errors then
-                        mode = 2
-                      else
-                        mode = 1 -- valid selective retry
-                      end
-                    end
+                    mode = 1 -- valid selective retry
                   end
-                elseif max_failures and failures + errors >= max_failures then
-                  mode = 3
-                else
-                  mode = 2
                 end
+              else
+                mode = 2
               end
             elseif existing_stat_count > 0 then
               mode = 2
@@ -625,22 +707,24 @@ module Minitest
               -- not a genuinely new run ID. The generation token is excluded
               -- because it intentionally survives cleanup until the shared TTL.
               local auxiliary_count = redis.call(
-                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21]
+                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21], KEYS[22]
               )
               if auxiliary_count > 0 then
                 mode = 2
               end
             end
 
-            -- Cleanup normally removes the stream before late cohort workers
-            -- finish starting. Honor the same completion grace without a stream;
-            -- the caller waits and registers again instead of resetting counters.
-            if mode == 1 and not stream_exists and current_generation and ARGV[6] ~= '1' then
+            -- A completed attempt must remain fenced for the full grace period,
+            -- whether or not its stream survived cleanup. Wait and re-register
+            -- rather than joining a terminal generation with no retry work.
+            if mode == 1 and current_generation then
               local completed_at = nil
               if redis.call('TYPE', KEYS[21]).ok == 'string' then
                 completed_at = tonumber(redis.call('GET', KEYS[21]))
               end
-              if completed_at then
+              if not completed_at then
+                mode = 2
+              elseif ARGV[6] ~= current_generation then
                 local redis_time = redis.call('TIME')
                 local now = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
                 local grace = tonumber(ARGV[5])
@@ -659,13 +743,13 @@ module Minitest
             -- attempt. All destructive changes and group creation are atomic.
             redis.call('DEL', KEYS[1])
             if mode == 2 then
-              for key_index = 3, 21 do
+              for key_index = 3, 22 do
                 redis.call('DEL', KEYS[key_index])
               end
               previous_failures = {}
               previous_errors = {}
             else
-              redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[21])
+              redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[21], KEYS[22])
               if mode == 1 or mode == 3 then
                 redis.call('SET', KEYS[15], 0, 'EX', ARGV[2])
                 redis.call('SET', KEYS[16], 0, 'EX', ARGV[2])
@@ -688,6 +772,40 @@ module Minitest
         end
 
         sig { returns(String) }
+        def reset_results_script
+          @reset_results_script ||= redis.script(:load, <<~LUA)
+            -- KEYS match adjust_results_script: generation, stream, retry_set,
+            -- control markers, ten statistics, three result lists, completed_at,
+            -- and retry_snapshot_digest.
+            if redis.call('TYPE', KEYS[1]).ok ~= 'string' or redis.call('GET', KEYS[1]) ~= ARGV[1] then
+              return redis.error_reply('STALEATTEMPT missing or mismatched generation')
+            elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
+              return redis.error_reply('COORDINATORSTREAM missing or invalid stream')
+            end
+
+            local size = tonumber(ARGV[3])
+            if not size or size < 0 or size % 1 ~= 0 or size > 9007199254740991 then
+              return redis.error_reply('COORDINATORSTATE unsafe full-rerun size')
+            end
+
+            redis.call('DEL', KEYS[3], KEYS[4], KEYS[6], KEYS[7])
+            for key_index = 8, 22 do
+              redis.call('DEL', KEYS[key_index])
+            end
+            local reply = {}
+            for stat_index = 1, 10 do
+              local value = stat_index == 10 and size or 0
+              redis.call('SET', KEYS[stat_index + 7], value, 'EX', ARGV[2])
+              reply[stat_index] = value
+            end
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[2])
+            redis.call('EXPIRE', KEYS[5], ARGV[2])
+            return reply
+          LUA
+        end
+
+        sig { returns(String) }
         def commit_results_script
           @commit_results_script ||= redis.script(:load, <<~LUA)
             local result_count = tonumber(ARGV[3])
@@ -697,6 +815,23 @@ module Minitest
             -- runs, assertions, passes, failures, errors, skips, requeues,
             -- discards, acks, size
             local deltas = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+            local function retry_snapshot_digest(failed_key, error_key)
+              local failed = redis.call('LRANGE', failed_key, 0, -1)
+              local errors = redis.call('LRANGE', error_key, 0, -1)
+              local pieces = {'failures', tostring(#failed)}
+              for _, identifier in ipairs(failed) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              pieces[#pieces + 1] = 'errors'
+              pieces[#pieces + 1] = tostring(#errors)
+              for _, identifier in ipairs(errors) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              return redis.sha1hex(table.concat(pieces, string.char(0)))
+            end
 
             -- Every statistics key is created before any stream entries are
             -- published. Refuse to recreate missing state as zero: doing so can
@@ -741,6 +876,20 @@ module Minitest
                 return redis.error_reply('COORDINATORSTATE invalid result list type')
               end
             end
+            local production_type = redis.call('TYPE', KEYS[16]).ok
+            local production_complete = false
+            if production_type == 'string' then
+              if redis.call('GET', KEYS[16]) ~= '1' then
+                return redis.error_reply('COORDINATORSTATE invalid production marker')
+              end
+              production_complete = true
+            elseif production_type ~= 'none' then
+              return redis.error_reply('COORDINATORSTATE invalid production marker type')
+            end
+            local digest_type = redis.call('TYPE', KEYS[22]).ok
+            if digest_type ~= 'none' and digest_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid retry snapshot digest type')
+            end
 
             local max_safe_integer = 9007199254740991
             local stat_values = {}
@@ -754,7 +903,7 @@ module Minitest
                 return redis.error_reply('COORDINATORSTATE invalid required key ' .. stat_key)
               end
               local value = tonumber(validation)
-              if math.abs(value) > max_safe_integer then
+              if value < 0 or value > max_safe_integer then
                 return redis.error_reply('COORDINATORSTATE unsafe statistic value ' .. stat_key)
               end
               stat_values[stat_index] = value
@@ -834,11 +983,14 @@ module Minitest
 
             local updated_acks = reply[result_count + 9]
             local updated_size = reply[result_count + 10]
-            if updated_acks == updated_size and redis.call('EXISTS', KEYS[16]) == 1 then
+            if updated_acks == updated_size and production_complete then
               local redis_time = redis.call('TIME')
               local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
               redis.call('SET', KEYS[21], completed_at, 'EX', ARGV[2])
+              local digest = retry_snapshot_digest(KEYS[14], KEYS[15])
+              redis.call('SET', KEYS[22], digest, 'EX', ARGV[2])
             end
+            reply[result_count + 11] = production_complete and 1 or 0
 
             for key_index = 1, #KEYS do
               redis.call('EXPIRE', KEYS[key_index], ARGV[2])
@@ -872,6 +1024,10 @@ module Minitest
                 return redis.error_reply('COORDINATORSTATE invalid result list type')
               end
             end
+            local digest_type = redis.call('TYPE', KEYS[22]).ok
+            if digest_type ~= 'none' and digest_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid retry snapshot digest type')
+            end
 
             local max_safe_integer = 9007199254740991
             for stat_index = 1, 10 do
@@ -891,7 +1047,8 @@ module Minitest
                 current_value = tonumber(validation)
               end
               local delta = tonumber(ARGV[stat_index + 4])
-              if not delta or delta % 1 ~= 0 or math.abs(current_value + delta) > max_safe_integer then
+              local updated_value = delta and current_value + delta or nil
+              if not delta or delta % 1 ~= 0 or updated_value < 0 or updated_value > max_safe_integer then
                 return redis.error_reply('COORDINATORSTATE unsafe statistic value ' .. stat_key)
               end
             end
@@ -899,6 +1056,7 @@ module Minitest
             if ARGV[3] == '1' then
               redis.call('DEL', KEYS[19], KEYS[20])
             end
+            redis.call('DEL', KEYS[22])
             local reply = {}
             for stat_index = 1, 10 do
               reply[stat_index] = redis.call('INCRBY', KEYS[stat_index + 7], ARGV[stat_index + 4])
@@ -939,12 +1097,53 @@ module Minitest
             if not group_exists then
               return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[5])
             end
-            if redis.call('TYPE', KEYS[5]).ok ~= 'string' or redis.call('TYPE', KEYS[6]).ok ~= 'string' then
-              return redis.error_reply('COORDINATORSTATE missing completion counters')
+            for list_index = 8, 9 do
+              local list_type = redis.call('TYPE', KEYS[list_index]).ok
+              if list_type ~= 'none' and list_type ~= 'list' then
+                return redis.error_reply('COORDINATORSTATE invalid retry result list type')
+              end
             end
-            local acks = tonumber(redis.call('GET', KEYS[5]))
-            local size = tonumber(redis.call('GET', KEYS[6]))
-            if not acks or not size then
+            local digest_type = redis.call('TYPE', KEYS[10]).ok
+            if digest_type ~= 'none' and digest_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid retry snapshot digest type')
+            end
+
+            local function retry_snapshot_digest(failed_key, error_key)
+              local failed = redis.call('LRANGE', failed_key, 0, -1)
+              local errors = redis.call('LRANGE', error_key, 0, -1)
+              local pieces = {'failures', tostring(#failed)}
+              for _, identifier in ipairs(failed) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              pieces[#pieces + 1] = 'errors'
+              pieces[#pieces + 1] = tostring(#errors)
+              for _, identifier in ipairs(errors) do
+                pieces[#pieces + 1] = tostring(string.len(identifier))
+                pieces[#pieces + 1] = identifier
+              end
+              return redis.sha1hex(table.concat(pieces, string.char(0)))
+            end
+
+            local max_safe_integer = 9007199254740991
+            local function read_safe_counter(key)
+              if redis.call('TYPE', key).ok ~= 'string' then
+                return nil
+              end
+              local validation = redis.pcall('INCRBY', key, 0)
+              if type(validation) == 'table' and validation.err then
+                return nil
+              end
+              local value = tonumber(validation)
+              if not value or value < 0 or value > max_safe_integer then
+                return nil
+              end
+              return value
+            end
+
+            local acks = read_safe_counter(KEYS[5])
+            local size = read_safe_counter(KEYS[6])
+            if not acks or not size or acks > size then
               return redis.error_reply('COORDINATORSTATE invalid completion counters')
             end
 
@@ -964,6 +1163,8 @@ module Minitest
                 local redis_time = redis.call('TIME')
                 local completed_at = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
                 redis.call('SET', KEYS[7], completed_at, 'EX', ARGV[2])
+                local digest = retry_snapshot_digest(KEYS[8], KEYS[9])
+                redis.call('SET', KEYS[10], digest, 'EX', ARGV[2])
               end
             end
             for key_index = 1, #KEYS do
@@ -1007,6 +1208,37 @@ module Minitest
             if not current_generation or current_generation ~= ARGV[1] then
               return 0
             end
+
+            local production_type = redis.call('TYPE', KEYS[3]).ok
+            if production_type == 'string' then
+              if redis.call('GET', KEYS[3]) ~= '1' then
+                return redis.error_reply('COORDINATORSTATE invalid production marker')
+              end
+              local function read_safe_counter(key)
+                if redis.call('TYPE', key).ok ~= 'string' then
+                  return nil
+                end
+                local validation = redis.pcall('INCRBY', key, 0)
+                if type(validation) == 'table' and validation.err then
+                  return nil
+                end
+                local value = tonumber(validation)
+                if not value or value < 0 or value > 9007199254740991 then
+                  return nil
+                end
+                return value
+              end
+              local acks = read_safe_counter(KEYS[4])
+              local size = read_safe_counter(KEYS[5])
+              if not acks or not size or acks > size then
+                return redis.error_reply('COORDINATORSTATE invalid completion counters')
+              elseif acks == size then
+                return 2
+              end
+            elseif production_type ~= 'none' then
+              return redis.error_reply('COORDINATORSTATE invalid production marker type')
+            end
+
             redis.call('SET', KEYS[2], 1, 'EX', ARGV[2])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return 1
@@ -1061,6 +1293,8 @@ module Minitest
           begin
             script_sha = case script_name
             when :register_consumergroup then register_consumergroup_script
+            when :read_results then read_results_script
+            when :reset_results then reset_results_script
             when :commit_results then commit_results_script
             when :cleanup then cleanup_script
             when :abort then abort_script
@@ -1085,6 +1319,8 @@ module Minitest
         def clear_script_cache(script_name)
           case script_name
           when :register_consumergroup then @register_consumergroup_script = nil
+          when :read_results then @read_results_script = nil
+          when :reset_results then @reset_results_script = nil
           when :commit_results then @commit_results_script = nil
           when :cleanup then @cleanup_script = nil
           when :abort then @abort_script = nil
@@ -1254,11 +1490,13 @@ module Minitest
                 key("acks"),
                 key("size"),
                 key("completed_at"),
+                list_key(ResultType::Failed.serialize),
+                list_key(ResultType::Error.serialize),
+                key("retry_snapshot_digest"),
               ],
               argv: argv,
             )
           end
-          @production_complete = true
         end
 
         sig { void }
@@ -1266,10 +1504,16 @@ module Minitest
           generation = T.must(@attempt_generation)
           applied = execute_script(
             script_name: :mark_attempt_state,
-            keys: [key("attempt_generation"), key("truncated")],
+            keys: [
+              key("attempt_generation"),
+              key("truncated"),
+              key("production_complete"),
+              key("acks"),
+              key("size"),
+            ],
             argv: [generation, configuration.key_ttl_seconds],
           )
-          return if applied == 1 || attempt_superseded?
+          return if [1, 2].include?(applied) || attempt_superseded?
 
           abort_with_diagnostic(<<~DIAGNOSTIC)
             ERROR: minitest-distributed could not persist max-failures truncation state.
@@ -1317,19 +1561,7 @@ module Minitest
 
         sig { params(results: ResultAggregate).returns(T::Boolean) }
         def run_complete?(results)
-          results.complete? && production_complete?
-        end
-
-        sig { returns(T::Boolean) }
-        def production_complete?
-          return @production_complete if @production_complete
-
-          marker = read_control_string("production_complete")
-          return false unless marker
-
-          raise CoordinatorStateError, "production_complete=#{marker.inspect}" unless marker == "1"
-
-          @production_complete = true
+          results.equal?(@combined_results) && results.complete? && @combined_results_production_complete == true
         end
 
         sig { returns(T.nilable(Integer)) }
@@ -1415,6 +1647,18 @@ module Minitest
         def handle_coordinator_state_error(error)
           return if attempt_superseded?
 
+          cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORSTREAM") ||
+            error.message.include?("no such key")
+          if cleanup_race_error && attempt_truncated?
+            abort_locally_with_diagnostic(<<~DIAGNOSTIC)
+              ERROR: minitest-distributed stopped this worker after another worker truncated the run.
+              run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+              redis_error=#{error.message.inspect}
+              The run was intentionally cut short at max_failures before this local batch could be committed.
+            DIAGNOSTIC
+            return
+          end
+
           @combined_results = nil
           begin
             results = combined_results
@@ -1425,9 +1669,18 @@ module Minitest
               redis_error=#{error.message.inspect} parse_error=#{parse_error.message.inspect}
             DIAGNOSTIC
             return
+          rescue Redis::CommandError => state_error
+            abort_with_diagnostic(<<~DIAGNOSTIC)
+              ERROR: minitest-distributed lost required Redis coordinator state and aborted the run.
+              run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+              redis_error=#{error.message.inspect} state_error=#{state_error.message.inspect}
+              The retained coordinator statistics are missing, invalid, or inconsistent.
+              The run is incomplete, so this was not normal cleanup.
+            DIAGNOSTIC
+            return
           end
-          mandatory_state_missing = error.message.start_with?("COORDINATORSTATE")
-          return if !mandatory_state_missing && (run_complete?(results) || results.abort?)
+          mandatory_state_missing = error.message.start_with?("COORDINATORSTATE", "WRONGTYPE")
+          return if !mandatory_state_missing && run_complete?(results)
 
           state = "run_id=#{configuration.run_id} worker_id=#{configuration.worker_id} " \
             "acks=#{results.acks} size=#{results.size} redis_error=#{error.message.inspect}"
@@ -1469,6 +1722,19 @@ module Minitest
           redis.get(control_key)
         end
 
+        sig { returns(T::Boolean) }
+        def attempt_truncated?
+          truncated_key = key("truncated")
+          redis.type(truncated_key) == "string" && redis.get(truncated_key) == "1"
+        end
+
+        sig { params(diagnostic: String).void }
+        def abort_locally_with_diagnostic(diagnostic)
+          @aborted = true
+          @stall_diagnostic = diagnostic
+          emit_message(diagnostic)
+        end
+
         sig { params(diagnostic: String).void }
         def abort_with_diagnostic(diagnostic)
           generation = T.must(@attempt_generation)
@@ -1482,9 +1748,7 @@ module Minitest
           # If ownership evidence itself was evicted, do not mutate shared state,
           # but still fail this worker with the diagnostic rather than silently
           # continuing or reporting success.
-          @aborted = true
-          @stall_diagnostic = diagnostic
-          emit_message(diagnostic)
+          abort_locally_with_diagnostic(diagnostic)
         end
 
         sig { params(probe: StallProbe).returns(String) }
@@ -1519,10 +1783,13 @@ module Minitest
 
         sig { params(value: T.untyped).returns(T.nilable(Integer)) }
         def parse_redis_integer(value)
-          case value
+          integer = case value
           when Integer then value
           when String then value.match?(/\A-?\d+\z/) ? value.to_i : nil
           end
+          return unless integer
+
+          integer if integer.between?(0, MAX_SAFE_STATISTIC)
         end
 
         sig { params(value: T.nilable(Integer)).returns(String) }
@@ -1575,6 +1842,41 @@ module Minitest
         )
         private_constant :LIST_KEY_RESULT_TYPES
 
+        sig { params(identifiers: T::Array[String]).returns(T.nilable(T::Array[Minitest::Runnable])) }
+        def materialize_retry_tests(identifiers)
+          identifiers.map do |identifier|
+            runnable = DefinedRunnable.from_identifier(identifier)
+            raise NameError, "retained test method no longer exists: #{identifier}" unless runnable.respond_to?(runnable.name)
+
+            runnable
+          end
+        rescue StandardError
+          nil
+        end
+
+        sig { params(size: Integer).void }
+        def reset_combined_results_for_full_rerun(size:)
+          generation = T.must(@attempt_generation)
+          keys = [
+            key("attempt_generation"),
+            stream_key,
+            key("retry_set"),
+            key("production_complete"),
+            key("production_heartbeat"),
+            key("stalled"),
+            key("truncated"),
+          ]
+          keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
+          keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
+          keys.push(key("completed_at"), key("retry_snapshot_digest"))
+          updated = execute_script(
+            script_name: :reset_results,
+            keys: keys,
+            argv: [generation, configuration.key_ttl_seconds, size],
+          )
+          update_combined_results(T.cast(updated, T::Array[Integer]), production_complete: false)
+        end
+
         sig do
           params(
             results: ResultAggregate,
@@ -1595,7 +1897,7 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys << key("completed_at")
+          keys.push(key("completed_at"), key("retry_snapshot_digest"))
           argv = [
             generation,
             configuration.key_ttl_seconds,
@@ -1613,7 +1915,7 @@ module Minitest
             results.size,
           ]
           updated = execute_script(script_name: :adjust_results, keys: keys, argv: argv)
-          update_combined_results(T.cast(updated, T::Array[Integer]))
+          update_combined_results(T.cast(updated, T::Array[Integer]), production_complete: false)
         end
 
         sig { params(name: String).returns(String) }
@@ -1656,11 +1958,14 @@ module Minitest
             key("attempt_generation"),
             key("truncated"),
             key("completed_at"),
+            key("retry_snapshot_digest"),
           )
 
           response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
           commit_statuses = T.cast(response.take(results.size), T::Array[Integer])
-          update_combined_results(T.cast(response.drop(results.size), T::Array[Integer]))
+          aggregate_response = T.cast(response.drop(results.size), T::Array[Integer])
+          production_complete = aggregate_response.pop == 1
+          update_combined_results(aggregate_response, production_complete: production_complete)
           build_runnable_results(results, commit_statuses)
         rescue Redis::CommandError => error
           cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORSTREAM") ||
@@ -1674,7 +1979,7 @@ module Minitest
           # consume's fail-closed coordinator-state path.
           @combined_results = nil
           terminal_results = combined_results
-          raise unless run_complete?(terminal_results) || terminal_results.abort?
+          raise unless run_complete?(terminal_results)
 
           build_runnable_results(results, Array.new(results.size, 0))
         end
@@ -1696,8 +2001,9 @@ module Minitest
           end
         end
 
-        sig { params(updated: T::Array[Integer]).void }
-        def update_combined_results(updated)
+        sig { params(updated: T::Array[Integer], production_complete: T::Boolean).void }
+        def update_combined_results(updated, production_complete:)
+          @combined_results_production_complete = production_complete
           @combined_results = ResultAggregate.new(
             max_failures: configuration.max_failures,
             runs: updated.fetch(0),
@@ -1760,6 +2066,9 @@ module Minitest
 
         MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS = 30.0
         private_constant :MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS
+
+        MAX_SAFE_STATISTIC = 9_007_199_254_740_991
+        private_constant :MAX_SAFE_STATISTIC
 
         PRODUCTION_BATCH_SIZE = 100
         private_constant :PRODUCTION_BATCH_SIZE

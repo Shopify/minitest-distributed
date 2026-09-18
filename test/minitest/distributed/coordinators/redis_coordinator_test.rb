@@ -177,6 +177,74 @@ module Minitest
           end
         end
 
+        def test_parse_redis_integer_rejects_negative_and_unsafe_values
+          max_safe = 9_007_199_254_740_991
+
+          assert_equal(max_safe, @coordinator.send(:parse_redis_integer, max_safe.to_s))
+          assert_nil(@coordinator.send(:parse_redis_integer, (max_safe + 1).to_s))
+          assert_nil(@coordinator.send(:parse_redis_integer, "-1"))
+        end
+
+        def test_run_completion_uses_production_state_from_the_same_snapshot
+          results = ResultAggregate.new(acks: 0, size: 0)
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results, results)
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results_production_complete, false)
+
+          refute(@coordinator.send(:run_complete?, results))
+
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results_production_complete, true)
+          assert(@coordinator.send(:run_complete?, results))
+        end
+
+        def test_truncated_cleanup_race_aborts_locally_without_marking_shared_state_stalled
+          local_diagnostic = T.let(nil, T.nilable(String))
+          shared_abort_called = T.let(false, T::Boolean)
+          @coordinator.define_singleton_method(:attempt_superseded?) { false }
+          @coordinator.define_singleton_method(:attempt_truncated?) { true }
+          @coordinator.define_singleton_method(:abort_locally_with_diagnostic) do |diagnostic|
+            local_diagnostic = diagnostic
+          end
+          @coordinator.define_singleton_method(:abort_with_diagnostic) { |*_args| shared_abort_called = true }
+
+          @coordinator.send(:handle_coordinator_state_error, Redis::CommandError.new("NOGROUP missing group"))
+
+          assert_includes(T.must(local_diagnostic), "another worker truncated the run")
+          refute(shared_abort_called)
+        end
+
+        def test_wrongtype_error_is_not_suppressed_by_terminal_counters
+          aborted_with = T.let(nil, T.nilable(String))
+          complete_results = ResultAggregate.new(acks: 0, size: 0)
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results, complete_results)
+          T.unsafe(@coordinator).instance_variable_set(:@combined_results_production_complete, true)
+          @coordinator.define_singleton_method(:attempt_superseded?) { false }
+          @coordinator.define_singleton_method(:attempt_truncated?) { false }
+          @coordinator.define_singleton_method(:combined_results) do
+            instance_variable_set(:@combined_results, complete_results)
+            instance_variable_set(:@combined_results_production_complete, true)
+            complete_results
+          end
+          @coordinator.define_singleton_method(:abort_with_diagnostic) { |diagnostic| aborted_with = diagnostic }
+
+          @coordinator.send(:handle_coordinator_state_error, Redis::CommandError.new("WRONGTYPE invalid stream"))
+
+          assert_includes(T.must(aborted_with), "lost required Redis coordinator state")
+        end
+
+        def test_coordinator_error_is_not_suppressed_by_incomplete_max_failure_state
+          aborted_with = T.let(nil, T.nilable(String))
+          incomplete_results = ResultAggregate.new(max_failures: 1, failures: 1, acks: 0, size: 2)
+          @coordinator.define_singleton_method(:attempt_superseded?) { false }
+          @coordinator.define_singleton_method(:attempt_truncated?) { false }
+          @coordinator.define_singleton_method(:combined_results) { incomplete_results }
+          @coordinator.define_singleton_method(:run_complete?) { |*_args| false }
+          @coordinator.define_singleton_method(:abort_with_diagnostic) { |diagnostic| aborted_with = diagnostic }
+
+          @coordinator.send(:handle_coordinator_state_error, Redis::CommandError.new("NOGROUP missing group"))
+
+          assert_includes(T.must(aborted_with), "lost required Redis coordinator state")
+        end
+
         def test_next_backoff_caps_within_a_bounded_number_of_iterations
           # Sanity check the doubling math: starting from INITIAL_BACKOFF, the cap must
           # be reached within a small, bounded number of iterations so that consume()

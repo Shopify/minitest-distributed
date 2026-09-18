@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "digest/sha1"
 
 class RedisRetryModeIntegrationTest < RedisIntegrationTest
   def test_retry_passing_build_is_noop
@@ -160,6 +161,106 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
     refute_worker_successful(worker2)
     refute(@redis.sismember(retry_set_key, "old-stream-entry"))
+  end
+
+  def test_retry_with_invalid_stream_type_runs_the_full_suite
+    run_id = "test_retry_with_invalid_stream_type_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/#{run_id}/queue", "wrong-type")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).size)
+  end
+
+  def test_retry_with_invalid_truncated_marker_runs_the_full_suite
+    run_id = "test_retry_with_invalid_truncated_marker_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    generation = String(@redis.get("minitest/#{run_id}/attempt_generation"))
+    stream = "minitest/#{run_id}/queue"
+    @redis.xgroup(:create, stream, "minitest-distributed-#{generation}", "0", mkstream: true)
+    @redis.set("minitest/#{run_id}/truncated", "0")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    refute_includes(worker2.stdout, "Cannot retry a run that was cut short")
+  end
+
+  def test_retry_with_negative_completion_counters_runs_the_full_suite
+    run_id = "test_retry_with_negative_completion_counters_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/#{run_id}/acks", "-1")
+    @redis.set("minitest/#{run_id}/size", "-1")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).acks)
+  end
+
+  def test_retry_with_inconsistent_aggregate_runs_the_full_suite
+    run_id = "test_retry_with_inconsistent_aggregate_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/#{run_id}/runs", "99")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).runs)
+  end
+
+  def test_invalid_retained_identifier_falls_back_to_a_clean_full_rerun
+    run_id = "test_invalid_retained_identifier_falls_back_to_a_clean_full_rerun"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    failed_list = "minitest/#{run_id}/failed_list"
+    identifier = "FailingTests#test_removed"
+    @redis.del(failed_list)
+    @redis.rpush(failed_list, identifier)
+    digest_payload = ["failures", "1", identifier.length.to_s, identifier, "errors", "0"].join("\0")
+    @redis.set("minitest/#{run_id}/retry_snapshot_digest", Digest::SHA1.hexdigest(digest_payload))
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "retained an invalid retry identifier")
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.runs)
+    assert_equal(0, results.requeues)
+    assert_equal(1, results.failures)
+  end
+
+  def test_substituted_valid_retry_identifier_falls_back_to_a_clean_full_rerun
+    run_id = "test_substituted_valid_retry_identifier_falls_back_to_a_clean_full_rerun"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    failed_list = "minitest/#{run_id}/failed_list"
+    @redis.del(failed_list)
+    @redis.rpush(failed_list, "FailingTests#test_pass_0")
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(100, results.runs)
+    assert_equal(0, results.requeues)
+    assert_equal(1, results.failures)
   end
 
   def test_retry_failed_build_with_consistently_failing_test
@@ -356,6 +457,23 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
 
     assert_worker_successful(worker2)
     refute(@redis.exists?("minitest/#{run_id}/truncated"))
+  end
+
+  def test_markerless_incomplete_max_failure_snapshot_runs_the_full_suite
+    run_id = "test_markerless_incomplete_max_failure_snapshot_runs_the_full_suite"
+    worker1 = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--no-retry-failures" => "true", "--max-failures" => "10" },
+    ).value
+    refute_worker_successful(worker1)
+    @redis.del("minitest/#{run_id}/truncated")
+
+    worker2 = spawn_redis_worker(test_file: "only_failures.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    refute_includes(worker2.stdout, "Cannot retry a run that was cut short")
+    assert_equal(100, combined_results(run_id: run_id).size)
   end
 
   def test_retry_attempt_on_run_that_was_cut_short

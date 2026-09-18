@@ -98,8 +98,8 @@ them to fail.
   normal end-of-run wait for your suite.
 - `--completion-grace=SECONDS` or `ENV[MINITEST_COMPLETION_GRACE_SECONDS]`
   (default: 30). Before reusing a recently completed run ID, wait this long for
-  late workers from the previous cohort to finish. Lower this only when your CI
-  guarantees tighter worker-start synchronization.
+  late workers from the previous cohort to finish. It cannot exceed the key TTL.
+  Lower this only when your CI guarantees tighter worker-start synchronization.
 - `--exclude-file=PATH_TO_FILE`: Specify a file of tests to be excluded
   from running. The file should include test identifiers seperated by
   newlines.

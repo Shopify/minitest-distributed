@@ -334,6 +334,7 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     # Once one worker decided to abort the run, the other workers will complete their tests
     # that are in progress before they will exit, increasing the number of failures.
     assert_operator(results.failures, :>=, 10)
+    refute(@redis.exists?("minitest/test_max_failures_with_multiple_workers/stalled"))
   end
 
   def test_with_progress
@@ -373,7 +374,7 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
 
       log = File.read(T.must(f.path))
       assert_includes(log, "xpending")
-      assert_includes(log, "mget")
+      assert_includes(log, "xreadgroup")
       assert_includes(log, "evalsha")
     end
   end

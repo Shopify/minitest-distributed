@@ -164,6 +164,60 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     T.unsafe(new_coordinator).send(:cleanup) if defined?(new_coordinator) && new_coordinator
   end
 
+  def test_immediate_retry_takes_over_a_completed_failed_stream_after_grace
+    run_id = "test_immediate_retry_takes_over_a_completed_failed_stream_after_grace"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    generation = String(@redis.get("minitest/#{run_id}/attempt_generation"))
+    stream = "minitest/#{run_id}/queue"
+    @redis.xgroup(:create, stream, "minitest-distributed-#{generation}", "0", mkstream: true)
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    refute_includes(worker2.stdout, "0 runs, 0 assertions")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(1, results.requeues)
+    assert_equal(1, results.failures)
+    assert_equal(101, results.runs)
+  end
+
+  def test_terminal_aggregate_reader_rejects_missing_and_wrong_type_statistics
+    run_id = "test_terminal_aggregate_reader_rejects_missing_and_wrong_type_statistics"
+    worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker)
+
+    assertions_key = "minitest/#{run_id}/assertions"
+    @redis.del(assertions_key)
+    configuration = redis_configuration(run_id: run_id, worker_id: "reader")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    error = T.unsafe(assert_raises(Redis::CommandError) { coordinator.combined_results })
+    assert_includes(error.message, "missing terminal statistic")
+
+    @redis.lpush(assertions_key, "wrong-type")
+    configuration = redis_configuration(run_id: run_id, worker_id: "second-reader")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    error = T.unsafe(assert_raises(Redis::CommandError) { coordinator.combined_results })
+    assert_includes(error.message, "invalid statistic type")
+  end
+
+  def test_publish_rejects_negative_completion_counters
+    run_id = "test_publish_rejects_negative_completion_counters"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+    @redis.set("minitest/#{run_id}/acks", "-1")
+    @redis.set("minitest/#{run_id}/size", "-1")
+
+    error = T.unsafe(assert_raises(Redis::CommandError) do
+      T.unsafe(coordinator).send(:publish_tests, [])
+    end)
+    assert_includes(error.message, "invalid completion counters")
+  ensure
+    T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
+  end
+
   def test_fractional_completion_grace_is_preserved_after_stream_cleanup
     run_id = "test_fractional_completion_grace_is_preserved_after_stream_cleanup"
     worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
@@ -189,6 +243,50 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_operator(elapsed, :>, 0.25)
   ensure
     T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
+  end
+
+  def test_completion_grace_bypass_is_scoped_to_the_generation_that_was_awaited
+    run_id = "test_completion_grace_bypass_is_scoped_to_the_generation_that_was_awaited"
+    worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker)
+
+    slow_configuration = Minitest::Distributed::Configuration.new(
+      coordinator_uri: URI(@redis_uri),
+      run_id: run_id,
+      worker_id: "slow-retry",
+      completion_grace_seconds: 1.0,
+    )
+    slow_retry = T.cast(
+      slow_configuration.coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    slow_thread = Thread.new { slow_retry.produce(test_selector: empty_test_selector) }
+
+    sleep(0.7)
+    fast_configuration = Minitest::Distributed::Configuration.new(
+      coordinator_uri: URI(@redis_uri),
+      run_id: run_id,
+      worker_id: "fast-retry",
+      completion_grace_seconds: 0.1,
+    )
+    fast_retry = T.cast(
+      fast_configuration.coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    fast_retry.produce(test_selector: empty_test_selector)
+    fast_generation = String(@redis.get("minitest/#{run_id}/attempt_generation"))
+    fast_completed_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    slow_thread.join(3)
+    refute_predicate(slow_thread, :alive?)
+    elapsed_after_fast_completion = Process.clock_gettime(Process::CLOCK_MONOTONIC) - fast_completed_at
+    assert_operator(elapsed_after_fast_completion, :>, 0.6)
+    refute_equal(fast_generation, @redis.get("minitest/#{run_id}/attempt_generation"))
+  ensure
+    slow_thread&.kill
+    slow_thread&.join
+    T.unsafe(slow_retry).send(:cleanup) if defined?(slow_retry) && slow_retry
+    T.unsafe(fast_retry).send(:cleanup) if defined?(fast_retry) && fast_retry
   end
 
   def test_completed_at_uses_numeric_microsecond_arithmetic
@@ -267,6 +365,20 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     refute(@redis.exists?("minitest/#{run_id}/stalled"))
   end
 
+  def test_completed_attempt_is_not_marked_truncated
+    run_id = "test_completed_attempt_is_not_marked_truncated"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+
+    T.unsafe(coordinator).send(:mark_run_truncated)
+
+    refute(@redis.exists?("minitest/#{run_id}/truncated"))
+    refute_predicate(coordinator, :aborted?)
+  ensure
+    T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
+  end
+
   def test_missing_generation_fails_closed_when_truncation_cannot_be_persisted
     run_id = "test_missing_generation_fails_closed_when_truncation_cannot_be_persisted"
     configuration = redis_configuration(run_id: run_id, worker_id: "worker")
@@ -319,6 +431,43 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     leader_thread&.join
   end
 
+  def test_native_wrongtype_from_direct_stream_commands_fails_closed
+    run_id = "test_native_wrongtype_from_direct_stream_commands_fails_closed"
+    leader = T.cast(
+      redis_configuration(run_id: run_id, worker_id: "leader").coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    follower = T.cast(
+      redis_configuration(run_id: run_id, worker_id: "follower").coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    discovery_started = Queue.new
+    release_discovery = Queue.new
+    blocking_selector = empty_test_selector
+    blocking_selector.define_singleton_method(:tests) do
+      discovery_started.push(true)
+      release_discovery.pop
+      []
+    end
+
+    leader_thread = Thread.new { leader.produce(test_selector: blocking_selector) }
+    discovery_started.pop
+    follower.produce(test_selector: empty_test_selector)
+    @redis.del("minitest/#{run_id}/queue")
+    @redis.set("minitest/#{run_id}/queue", "wrong-type")
+
+    capture_io do
+      follower.consume(reporter: Minitest::CompositeReporter.new)
+    end
+
+    assert_predicate(follower, :aborted?)
+    assert_includes(T.must(follower.stall_diagnostic), "WRONGTYPE")
+    assert(@redis.exists?("minitest/#{run_id}/stalled"))
+  ensure
+    leader_thread&.kill
+    leader_thread&.join
+  end
+
   def test_invalid_statistic_emits_diagnostic_before_aborting
     run_id = "test_invalid_statistic_emits_diagnostic_before_aborting"
     configuration = redis_configuration(run_id: run_id, worker_id: "worker")
@@ -332,7 +481,8 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     end
 
     assert_predicate(coordinator, :aborted?)
-    assert_includes(T.must(coordinator.stall_diagnostic), "could not parse Redis coordinator state")
+    assert_includes(T.must(coordinator.stall_diagnostic), "lost required Redis coordinator state")
+    assert_includes(T.must(coordinator.stall_diagnostic), "invalid statistic")
 
     Tempfile.create("distributed-summary") do |output|
       summary = Minitest::Distributed::Reporters::DistributedSummaryReporter.new(

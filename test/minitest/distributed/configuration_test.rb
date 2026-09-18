@@ -39,6 +39,12 @@ module Minitest
 
         assert_raises(ArgumentError) { configuration.coordinator }
       end
+
+      def test_rejects_completion_grace_larger_than_key_ttl
+        configuration = Configuration.new(key_ttl_seconds: 5, completion_grace_seconds: 30.0)
+
+        assert_raises(ArgumentError) { configuration.coordinator }
+      end
     end
   end
 end

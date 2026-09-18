@@ -157,6 +157,10 @@ module Minitest
         unless completion_grace_seconds.positive? && completion_grace_seconds.finite?
           raise ArgumentError, "completion_grace_seconds must be finite and greater than zero"
         end
+
+        if key_ttl_seconds < completion_grace_seconds
+          raise ArgumentError, "key_ttl_seconds must be greater than or equal to completion_grace_seconds"
+        end
       end
     end
   end
