@@ -145,6 +145,67 @@ module Minitest
           assert_nil(observed_cache)
         end
 
+        def test_mutating_scripts_disable_transparent_reconnect_replay
+          mutation_count = 0
+          reconnect_disabled = T.let(false, T::Boolean)
+          fake_redis = Redis.allocate
+          fake_redis.define_singleton_method(:without_reconnect) do |&block|
+            reconnect_disabled = true
+            block.call
+          ensure
+            reconnect_disabled = false
+          end
+          fake_redis.define_singleton_method(:evalsha) do |*_args, **_kwargs|
+            mutation_count += 1
+            mutation_count += 1 unless reconnect_disabled # Simulate redis-rb replay after a lost response.
+            raise Redis::ConnectionError, "response lost after execution"
+          end
+          T.unsafe(@coordinator).instance_variable_set(:@redis, fake_redis)
+          T.unsafe(@coordinator).instance_variable_set(:@adjust_results_script, "loaded-sha")
+
+          assert_raises(Redis::ConnectionError) do
+            T.unsafe(@coordinator).send(:execute_script, script_name: :adjust_results, keys: [], argv: [])
+          end
+          assert_equal(1, mutation_count)
+        end
+
+        def test_mutating_without_reconnect_scopes_are_serialized_across_threads
+          active_scopes = 0
+          max_active_scopes = 0
+          scope_lock = Mutex.new
+          fake_redis = Redis.allocate
+          fake_redis.define_singleton_method(:without_reconnect) do |&block|
+            scope_lock.synchronize do
+              active_scopes += 1
+              max_active_scopes = [max_active_scopes, active_scopes].max
+            end
+            sleep(0.02)
+            block.call
+          ensure
+            scope_lock.synchronize { active_scopes -= 1 }
+          end
+          fake_redis.define_singleton_method(:evalsha) { |*_args, **_kwargs| 0 }
+          T.unsafe(@coordinator).instance_variable_set(:@redis, fake_redis)
+          T.unsafe(@coordinator).instance_variable_set(:@adjust_results_script, "loaded-sha")
+
+          threads = 2.times.map do
+            Thread.new do
+              T.unsafe(@coordinator).send(:execute_script, script_name: :adjust_results, keys: [], argv: [])
+            end
+          end
+          threads.each(&:join)
+
+          assert_equal(1, max_active_scopes)
+        end
+
+        def test_truncated_follower_skips_the_consumer_loop
+          T.unsafe(@coordinator).instance_variable_set(:@truncated_follower, true)
+          @coordinator.define_singleton_method(:claim_stale_runnables) { raise "consumer loop entered" }
+
+          @coordinator.consume(reporter: Minitest::CompositeReporter.new)
+          assert(true)
+        end
+
         def test_production_heartbeat_retries_transient_connection_errors
           attempts = 0
           @coordinator.configuration.stall_timeout_seconds = 0.02

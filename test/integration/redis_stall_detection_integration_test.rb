@@ -392,8 +392,41 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_equal("1", @redis.get("minitest/v3/#{run_id}/truncated"))
     refute(@redis.exists?("minitest/v3/#{run_id}/completed_at"))
     refute(@redis.exists?("minitest/v3/#{run_id}/retry_snapshot_digest"))
+
+    truncated_generation = String(@redis.get("minitest/v3/#{run_id}/attempt_generation"))
+    @redis.expire("minitest/v3/#{run_id}/truncated_generation", 1)
+    replacement_configuration = redis_configuration(run_id: run_id, worker_id: "replacement")
+    replacement = T.cast(
+      replacement_configuration.coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    replacement.produce(test_selector: empty_test_selector)
+    refute_equal(truncated_generation, @redis.get("minitest/v3/#{run_id}/attempt_generation"))
+    assert_predicate(replacement, :aborted?)
+    assert_operator(@redis.ttl("minitest/v3/#{run_id}/truncated_generation"), :>, 60)
+
+    stale_error = T.unsafe(assert_raises(Redis::CommandError) do
+      T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
+    end)
+    capture_io { T.unsafe(coordinator).send(:handle_coordinator_state_error, stale_error) }
+    assert_includes(T.must(coordinator.stall_diagnostic), "another worker truncated the run")
+    refute(@redis.exists?("minitest/v3/#{run_id}/stalled"))
+
+    follower_configuration = redis_configuration(run_id: run_id, worker_id: "truncated-follower")
+    follower = T.cast(
+      follower_configuration.coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    follower.produce(test_selector: empty_test_selector)
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    follower.consume(reporter: Minitest::CompositeReporter.new)
+    assert_operator(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at, :<, 0.1)
+    assert_predicate(follower, :aborted?)
+    assert(@redis.exists?("minitest/v3/#{run_id}/queue"), "truncated follower cleaned up the replacement stream")
   ensure
     T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
+    T.unsafe(replacement).send(:cleanup) if defined?(replacement) && replacement
+    T.unsafe(follower).send(:cleanup) if defined?(follower) && follower
     T.unsafe(Object).send(:remove_const, :TruncationRaceFixture) if Object.const_defined?(:TruncationRaceFixture)
   end
 

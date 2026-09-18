@@ -263,6 +263,30 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(1, results.failures)
   end
 
+  def test_retry_grace_refreshes_a_snapshot_written_with_a_shorter_ttl
+    run_id = "test_retry_grace_refreshes_a_snapshot_written_with_a_shorter_ttl"
+    worker1 = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      arguments: { "--key-ttl" => "2", "--completion-grace" => "0.1" },
+    ).value
+    refute_worker_successful(worker1)
+
+    worker2 = spawn_redis_worker(
+      test_file: "failing_tests.rb",
+      run_id: run_id,
+      timeout: 8,
+      arguments: { "--key-ttl" => "4", "--completion-grace" => "3" },
+    ).value
+    refute_worker_successful(worker2)
+    refute_includes(worker2.stdout, "Running the full test suite instead of a selective retry")
+
+    results = combined_results(run_id: run_id)
+    assert_equal(1, results.size)
+    assert_equal(1, results.requeues)
+    assert_equal(101, results.runs)
+  end
+
   def test_retry_failed_build_with_consistently_failing_test
     worker1 = spawn_redis_worker(
       test_file: "failing_tests.rb",

@@ -98,9 +98,12 @@ module Minitest
           @group_name = T.let(BASE_GROUP_NAME, String)
           @attempt_generation = T.let(nil, T.nilable(String))
           @production_heartbeat_error = T.let(nil, T.nilable(StandardError))
+          @mutating_script_mutex = T.let(Mutex.new, Mutex)
           @local_results = T.let(ResultAggregate.new, ResultAggregate)
           @combined_results = T.let(nil, T.nilable(ResultAggregate))
           @combined_results_production_complete = T.let(nil, T.nilable(T::Boolean))
+          @attempt_truncated = T.let(false, T::Boolean)
+          @truncated_follower = T.let(false, T::Boolean)
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
@@ -173,7 +176,12 @@ module Minitest
           ]
           registration_keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           registration_keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          registration_keys.push(key("truncated"), key("completed_at"), key("retry_snapshot_digest"))
+          registration_keys.push(
+            key("truncated"),
+            key("completed_at"),
+            key("retry_snapshot_digest"),
+            key("truncated_generation"),
+          )
           registration = T.let(nil, T.untyped)
           registration_mode = T.let(-1, Integer)
           leader = T.let(false, T::Boolean)
@@ -196,6 +204,10 @@ module Minitest
             @attempt_generation = String(registration.fetch(1))
             @group_name = "#{BASE_GROUP_NAME}-#{@attempt_generation}"
             registration_mode = Integer(registration.fetch(2))
+            if registration_mode == -3
+              @aborted = true
+              @truncated_follower = true
+            end
             break unless registration_mode == -2
 
             sleep(Float(registration.fetch(5)))
@@ -282,6 +294,8 @@ module Minitest
         # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
+          return if @truncated_follower
+
           exponential_backoff = INITIAL_BACKOFF
           last_progress_at = monotonic_time
           initial_results = combined_results
@@ -300,10 +314,12 @@ module Minitest
             # First, see if there are any pending tests from other workers to claim.
             stale_runnables = claim_stale_runnables
             process_batch(stale_runnables, reporter)
+            break if commit_observed_truncation?
 
             # Then, try to process a regular batch of messages
             fresh_runnables = claim_fresh_runnables(block: exponential_backoff)
             process_batch(fresh_runnables, reporter)
+            break if commit_observed_truncation?
 
             run_results = combined_results
 
@@ -555,7 +571,7 @@ module Minitest
             -- KEYS: stream, generation token, stalled, production_complete,
             -- production_heartbeat, retry_set, ten statistics, the
             -- skipped/failed/error lists, truncated, completed_at, then the
-            -- completed retry-snapshot digest.
+            -- completed retry-snapshot digest and truncating generation.
             local max_safe_integer = 9007199254740991
             local invalid_active_state = false
 
@@ -586,6 +602,17 @@ module Minitest
             local stalled, stalled_invalid = read_marker(KEYS[3])
             local production_complete, production_complete_invalid = read_marker(KEYS[4])
             local truncated, truncated_invalid = read_marker(KEYS[20])
+            local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
+            local truncated_generation = nil
+            if truncated then
+              if truncated_generation_type == 'string' then
+                truncated_generation = redis.call('GET', KEYS[23])
+              else
+                truncated_invalid = true
+              end
+            elseif truncated_generation_type ~= 'none' then
+              truncated_invalid = true
+            end
             if stalled_invalid or production_complete_invalid or truncated_invalid then
               invalid_active_state = true
             end
@@ -656,7 +683,13 @@ module Minitest
             -- retained state passes validation. Terminal attempts fall through
             -- to grace handling and fenced retry takeover below.
             if stream_exists and current_generation and not stalled and not invalid_active_state then
-              if not (production_complete and existing_stat_count == 10 and stat_values[9] == stat_values[10]) then
+              if truncated and truncated_generation ~= current_generation then
+                -- A mode-3 replacement generation is already active. Join it as
+                -- an explicitly aborted follower instead of replacing its token.
+                return {0, current_generation, -3, {}, {}}
+              elseif not truncated and not (
+                production_complete and existing_stat_count == 10 and stat_values[9] == stat_values[10]
+              ) then
                 return {0, current_generation, -1, {}, {}}
               end
             end
@@ -707,7 +740,7 @@ module Minitest
               -- not a genuinely new run ID. The generation token is excluded
               -- because it intentionally survives cleanup until the shared TTL.
               local auxiliary_count = redis.call(
-                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21], KEYS[22]
+                'EXISTS', KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[17], KEYS[18], KEYS[19], KEYS[20], KEYS[21], KEYS[22], KEYS[23]
               )
               if auxiliary_count > 0 then
                 mode = 2
@@ -733,6 +766,15 @@ module Minitest
                   remaining_grace = grace
                 end
                 if remaining_grace > 0 then
+                  -- The terminal snapshot may have been written with a shorter
+                  -- TTL than this retry invocation requests. Refresh every
+                  -- validated retained key before sleeping so the snapshot
+                  -- survives the full current grace period and safety margin.
+                  for key_index = 1, #KEYS do
+                    if redis.call('EXISTS', KEYS[key_index]) == 1 then
+                      redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+                    end
+                  end
                   return {0, current_generation, -2, {}, {}, tostring(remaining_grace)}
                 end
               end
@@ -743,7 +785,7 @@ module Minitest
             -- attempt. All destructive changes and group creation are atomic.
             redis.call('DEL', KEYS[1])
             if mode == 2 then
-              for key_index = 3, 22 do
+              for key_index = 3, 23 do
                 redis.call('DEL', KEYS[key_index])
               end
               previous_failures = {}
@@ -765,8 +807,16 @@ module Minitest
             redis.call('SET', KEYS[2], generation, 'EX', ARGV[2])
             local group_name = ARGV[1] .. '-' .. generation
             redis.call('XGROUP', 'CREATE', KEYS[1], group_name, '0', 'MKSTREAM')
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
             redis.call('SET', KEYS[5], 0, 'EX', ARGV[2])
+            -- Retained state may come from an attempt with a shorter TTL. Align
+            -- every surviving key with this generation before returning so a
+            -- mode-3 follower cannot lose its truncation discriminator between
+            -- registration and result adjustment.
+            for key_index = 1, #KEYS do
+              if redis.call('EXISTS', KEYS[key_index]) == 1 then
+                redis.call('EXPIRE', KEYS[key_index], ARGV[2])
+              end
+            end
             return {1, generation, mode, previous_failures, previous_errors}
           LUA
         end
@@ -776,7 +826,7 @@ module Minitest
           @reset_results_script ||= redis.script(:load, <<~LUA)
             -- KEYS match adjust_results_script: generation, stream, retry_set,
             -- control markers, ten statistics, three result lists, completed_at,
-            -- and retry_snapshot_digest.
+            -- retry_snapshot_digest, and truncated_generation.
             if redis.call('TYPE', KEYS[1]).ok ~= 'string' or redis.call('GET', KEYS[1]) ~= ARGV[1] then
               return redis.error_reply('STALEATTEMPT missing or mismatched generation')
             elseif redis.call('TYPE', KEYS[2]).ok ~= 'stream' then
@@ -789,7 +839,7 @@ module Minitest
             end
 
             redis.call('DEL', KEYS[3], KEYS[4], KEYS[6], KEYS[7])
-            for key_index = 8, 22 do
+            for key_index = 8, 23 do
               redis.call('DEL', KEYS[key_index])
             end
             local reply = {}
@@ -910,13 +960,14 @@ module Minitest
             end
 
             local truncated_type = redis.call('TYPE', KEYS[20]).ok
+            local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
             local truncated = false
             if truncated_type == 'string' then
-              if redis.call('GET', KEYS[20]) ~= '1' then
+              if redis.call('GET', KEYS[20]) ~= '1' or truncated_generation_type ~= 'string' then
                 return redis.error_reply('COORDINATORSTATE invalid truncated marker')
               end
               truncated = true
-            elseif truncated_type ~= 'none' then
+            elseif truncated_type ~= 'none' or truncated_generation_type ~= 'none' then
               return redis.error_reply('COORDINATORSTATE invalid truncated marker type')
             end
             if truncated then
@@ -928,6 +979,7 @@ module Minitest
                 truncated_reply[result_count + stat_index] = stat_values[stat_index]
               end
               truncated_reply[result_count + 11] = production_complete and 1 or 0
+              truncated_reply[result_count + 12] = 1
               return truncated_reply
             end
 
@@ -1013,6 +1065,7 @@ module Minitest
               redis.call('SET', KEYS[22], digest, 'EX', ARGV[2])
             end
             reply[result_count + 11] = production_complete and 1 or 0
+            reply[result_count + 12] = 0
 
             for key_index = 1, #KEYS do
               redis.call('EXPIRE', KEYS[key_index], ARGV[2])
@@ -1049,6 +1102,15 @@ module Minitest
             local digest_type = redis.call('TYPE', KEYS[22]).ok
             if digest_type ~= 'none' and digest_type ~= 'string' then
               return redis.error_reply('COORDINATORSTATE invalid retry snapshot digest type')
+            end
+            local truncated_type = redis.call('TYPE', KEYS[7]).ok
+            local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
+            if truncated_type == 'string' then
+              if redis.call('GET', KEYS[7]) ~= '1' or truncated_generation_type ~= 'string' then
+                return redis.error_reply('COORDINATORSTATE invalid truncated state')
+              end
+            elseif truncated_type ~= 'none' or truncated_generation_type ~= 'none' then
+              return redis.error_reply('COORDINATORSTATE invalid truncated state type')
             end
 
             local max_safe_integer = 9007199254740991
@@ -1262,6 +1324,7 @@ module Minitest
             end
 
             redis.call('SET', KEYS[2], 1, 'EX', ARGV[2])
+            redis.call('SET', KEYS[6], current_generation, 'EX', ARGV[2])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return 1
           LUA
@@ -1326,7 +1389,19 @@ module Minitest
             when :mark_attempt_state then mark_attempt_state_script
             else raise ArgumentError, "Unknown Redis script: #{script_name}"
             end
-            redis.evalsha(script_sha, keys: keys, argv: argv)
+            if script_name == :read_results
+              redis.evalsha(script_sha, keys: keys, argv: argv)
+            else
+              # redis-rb retries commands after reconnect by default. A response
+              # can be lost after Redis executes EVALSHA, so transparently
+              # replaying a mutating script can duplicate counters or stream
+              # entries. NOSCRIPT remains the only manually retried error below.
+              @mutating_script_mutex.synchronize do
+                redis.without_reconnect do
+                  redis.evalsha(script_sha, keys: keys, argv: argv)
+                end
+              end
+            end
           rescue Redis::CommandError => error
             if error.message.start_with?("NOSCRIPT") && attempts.zero?
               attempts += 1
@@ -1532,6 +1607,7 @@ module Minitest
               key("production_complete"),
               key("acks"),
               key("size"),
+              key("truncated_generation"),
             ],
             argv: [generation, configuration.key_ttl_seconds],
           )
@@ -1667,11 +1743,7 @@ module Minitest
 
         sig { params(error: Redis::CommandError).void }
         def handle_coordinator_state_error(error)
-          return if attempt_superseded?
-
-          cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORSTREAM") ||
-            error.message.include?("no such key")
-          if cleanup_race_error && attempt_truncated?
+          if attempt_truncated?
             abort_locally_with_diagnostic(<<~DIAGNOSTIC)
               ERROR: minitest-distributed stopped this worker after another worker truncated the run.
               run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
@@ -1680,6 +1752,7 @@ module Minitest
             DIAGNOSTIC
             return
           end
+          return if attempt_superseded?
 
           @combined_results = nil
           begin
@@ -1745,9 +1818,21 @@ module Minitest
         end
 
         sig { returns(T::Boolean) }
+        def commit_observed_truncation?
+          @attempt_truncated
+        end
+
+        sig { returns(T::Boolean) }
         def attempt_truncated?
+          attempt_generation = @attempt_generation
+          return false unless attempt_generation
+
           truncated_key = key("truncated")
-          redis.type(truncated_key) == "string" && redis.get(truncated_key) == "1"
+          truncated_generation_key = key("truncated_generation")
+          return false unless redis.type(truncated_key) == "string"
+          return false unless redis.type(truncated_generation_key) == "string"
+
+          redis.get(truncated_key) == "1" && redis.get(truncated_generation_key) == attempt_generation
         end
 
         sig { params(diagnostic: String).void }
@@ -1890,7 +1975,7 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.push(key("completed_at"), key("retry_snapshot_digest"))
+          keys.push(key("completed_at"), key("retry_snapshot_digest"), key("truncated_generation"))
           updated = execute_script(
             script_name: :reset_results,
             keys: keys,
@@ -1919,7 +2004,7 @@ module Minitest
           ]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
-          keys.push(key("completed_at"), key("retry_snapshot_digest"))
+          keys.push(key("completed_at"), key("retry_snapshot_digest"), key("truncated_generation"))
           argv = [
             generation,
             configuration.key_ttl_seconds,
@@ -1981,12 +2066,18 @@ module Minitest
             key("truncated"),
             key("completed_at"),
             key("retry_snapshot_digest"),
+            key("truncated_generation"),
           )
 
           response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
           commit_statuses = T.cast(response.take(results.size), T::Array[Integer])
           aggregate_response = T.cast(response.drop(results.size), T::Array[Integer])
+          attempt_truncated = aggregate_response.pop == 1
           production_complete = aggregate_response.pop == 1
+          if attempt_truncated
+            @attempt_truncated = true
+            @aborted = true
+          end
           update_combined_results(aggregate_response, production_complete: production_complete)
           build_runnable_results(results, commit_statuses)
         rescue Redis::CommandError => error
