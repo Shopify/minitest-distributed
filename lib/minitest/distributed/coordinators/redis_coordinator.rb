@@ -909,6 +909,28 @@ module Minitest
               stat_values[stat_index] = value
             end
 
+            local truncated_type = redis.call('TYPE', KEYS[20]).ok
+            local truncated = false
+            if truncated_type == 'string' then
+              if redis.call('GET', KEYS[20]) ~= '1' then
+                return redis.error_reply('COORDINATORSTATE invalid truncated marker')
+              end
+              truncated = true
+            elseif truncated_type ~= 'none' then
+              return redis.error_reply('COORDINATORSTATE invalid truncated marker type')
+            end
+            if truncated then
+              local truncated_reply = {}
+              for result_index = 1, result_count do
+                truncated_reply[result_index] = 0
+              end
+              for stat_index = 1, 10 do
+                truncated_reply[result_count + stat_index] = stat_values[stat_index]
+              end
+              truncated_reply[result_count + 11] = production_complete and 1 or 0
+              return truncated_reply
+            end
+
             local allowed_result_types = {
               passed = true, failed = true, error = true, skipped = true,
               discarded = true, requeued = true
@@ -1920,7 +1942,7 @@ module Minitest
 
         sig { params(name: String).returns(String) }
         def key(name)
-          "minitest/#{configuration.run_id}/#{name}"
+          "#{REDIS_PROTOCOL_NAMESPACE}/#{configuration.run_id}/#{name}"
         end
 
         sig { params(name: String).returns(String) }
@@ -2056,7 +2078,10 @@ module Minitest
           [backoff << 1, MAX_BACKOFF].min
         end
 
-        BASE_GROUP_NAME = "minitest-distributed"
+        REDIS_PROTOCOL_NAMESPACE = "minitest/v3"
+        private_constant :REDIS_PROTOCOL_NAMESPACE
+
+        BASE_GROUP_NAME = "minitest-distributed-v3"
         private_constant :BASE_GROUP_NAME
 
         # Confirm a drained mismatch because the diagnostic probe itself uses

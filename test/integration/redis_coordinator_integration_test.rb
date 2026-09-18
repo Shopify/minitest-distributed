@@ -334,7 +334,7 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     # Once one worker decided to abort the run, the other workers will complete their tests
     # that are in progress before they will exit, increasing the number of failures.
     assert_operator(results.failures, :>=, 10)
-    refute(@redis.exists?("minitest/test_max_failures_with_multiple_workers/stalled"))
+    refute(@redis.exists?("minitest/v3/test_max_failures_with_multiple_workers/stalled"))
   end
 
   def test_with_progress
@@ -354,6 +354,18 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     output = workers_output(workers)
     assert_includes(output, "/100] PassingTests#test_pass_0")
     assert_includes(output, "/100] PassingTests#test_pass_99")
+  end
+
+  def test_versioned_protocol_namespace_does_not_mutate_legacy_state
+    run_id = "test_versioned_protocol_namespace_does_not_mutate_legacy_state"
+    legacy_queue = "minitest/#{run_id}/queue"
+    @redis.set(legacy_queue, "legacy-v2-state")
+
+    worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+
+    assert_worker_successful(worker)
+    assert_equal("legacy-v2-state", @redis.get(legacy_queue))
+    assert_equal("100", @redis.get("minitest/v3/#{run_id}/size"))
   end
 
   def test_with_redis_log

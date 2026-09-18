@@ -32,7 +32,7 @@ class RedisKeyExpiryIntegrationTest < RedisIntegrationTest
 
     # A failed run keeps its failure list around for retry mode, so the expiry has
     # to cover the list keys too, not just the counters.
-    assert_includes(keys, "minitest/#{run_id}/failed_list")
+    assert_includes(keys, "minitest/v3/#{run_id}/failed_list")
 
     keys.each do |key|
       assert_operator(@redis.ttl(key), :>, 0, "#{key} has no expiry")
@@ -63,6 +63,6 @@ class RedisKeyExpiryIntegrationTest < RedisIntegrationTest
   private
 
   def run_keys(run_id)
-    @redis.keys("minitest/#{run_id}/*")
+    @redis.keys("minitest/v3/#{run_id}/*")
   end
 end

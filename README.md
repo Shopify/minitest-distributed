@@ -98,14 +98,22 @@ them to fail.
   normal end-of-run wait for your suite.
 - `--completion-grace=SECONDS` or `ENV[MINITEST_COMPLETION_GRACE_SECONDS]`
   (default: 30). Before reusing a recently completed run ID, wait this long for
-  late workers from the previous cohort to finish. It cannot exceed the key TTL.
-  Lower this only when your CI guarantees tighter worker-start synchronization.
+  late workers from the previous cohort to finish. The key TTL must exceed this
+  grace period by at least one second so the retained retry snapshot cannot
+  expire while a worker is waiting. Lower this only when your CI guarantees
+  tighter worker-start synchronization.
 - `--exclude-file=PATH_TO_FILE`: Specify a file of tests to be excluded
   from running. The file should include test identifiers seperated by
   newlines.
 - `--include-file=PATH_TO_FILE`: Specify a file of tests to be included in
   the test run. The file should include test identifiers seperated by
   newlines.
+
+Version 0.3 uses the versioned Redis namespace `minitest/v3/...`; it does not
+share streams or counters with the legacy 0.2 protocol. All workers in one
+cohort should still use the same gem version. Mixed-version cohorts run in
+separate namespaces and can duplicate test execution, but cannot mutate each
+other's coordinator state.
 
 **Limitations**
 

@@ -40,10 +40,12 @@ module Minitest
         assert_raises(ArgumentError) { configuration.coordinator }
       end
 
-      def test_rejects_completion_grace_larger_than_key_ttl
-        configuration = Configuration.new(key_ttl_seconds: 5, completion_grace_seconds: 30.0)
+      def test_rejects_completion_grace_without_a_one_second_ttl_margin
+        too_short = Configuration.new(key_ttl_seconds: 5, completion_grace_seconds: 30.0)
+        equal = Configuration.new(key_ttl_seconds: 1, completion_grace_seconds: 1.0)
 
-        assert_raises(ArgumentError) { configuration.coordinator }
+        assert_raises(ArgumentError) { too_short.coordinator }
+        assert_raises(ArgumentError) { equal.coordinator }
       end
     end
   end

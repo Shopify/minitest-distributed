@@ -17,6 +17,7 @@ module Minitest
       DEFAULT_KEY_TTL_SECONDS = 86_400 # 24 hours
       DEFAULT_STALL_TIMEOUT_SECONDS = 300.0 # 5 minutes
       DEFAULT_COMPLETION_GRACE_SECONDS = 30.0
+      MIN_COMPLETION_GRACE_TTL_MARGIN_SECONDS = 1.0
 
       class << self
         extend T::Sig
@@ -158,8 +159,8 @@ module Minitest
           raise ArgumentError, "completion_grace_seconds must be finite and greater than zero"
         end
 
-        if key_ttl_seconds < completion_grace_seconds
-          raise ArgumentError, "key_ttl_seconds must be greater than or equal to completion_grace_seconds"
+        if key_ttl_seconds < completion_grace_seconds + MIN_COMPLETION_GRACE_TTL_MARGIN_SECONDS
+          raise ArgumentError, "key_ttl_seconds must exceed completion_grace_seconds by at least one second"
         end
       end
     end
