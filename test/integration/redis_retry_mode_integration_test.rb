@@ -136,6 +136,19 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     end
   end
 
+  def test_retry_with_missing_generation_runs_the_full_suite
+    run_id = "test_retry_with_missing_generation_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker1)
+
+    @redis.del("minitest/v3/#{run_id}/attempt_generation")
+
+    worker2 = spawn_redis_worker(test_file: "failing_tests.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).size)
+  end
+
   def test_retry_with_invalid_generation_type_runs_the_full_suite
     run_id = "test_retry_with_invalid_generation_type_runs_the_full_suite"
     worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
@@ -519,6 +532,24 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
 
     assert_worker_successful(worker2)
     refute(@redis.exists?("minitest/v3/#{run_id}/truncated"))
+  end
+
+  def test_incomplete_truncation_fence_rejects_retry_without_erasing_marker
+    run_id = "test_incomplete_truncation_fence_rejects_retry_without_erasing_marker"
+    worker1 = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--no-retry-failures" => "true", "--max-failures" => "10" },
+    ).value
+    refute_worker_successful(worker1)
+    @redis.del("minitest/v3/#{run_id}/truncated_generation")
+
+    worker2 = spawn_redis_worker(test_file: "only_failures.rb", run_id: run_id).value
+    refute_worker_successful(worker2)
+    assert_output_includes(worker2, "retained truncation fence is incomplete")
+    assert_output_includes(worker2, "retained truncation state is incomplete")
+    refute_includes(worker2.stdout, "Running the full test suite instead of a selective retry")
+    assert_equal("1", @redis.get("minitest/v3/#{run_id}/truncated"))
   end
 
   def test_markerless_incomplete_max_failure_snapshot_runs_the_full_suite

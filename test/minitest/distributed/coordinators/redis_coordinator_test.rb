@@ -240,6 +240,20 @@ module Minitest
           assert(true)
         end
 
+        def test_production_heartbeat_stops_cooperatively_before_next_redis_call
+          redis_call_made = T.let(false, T::Boolean)
+          @coordinator.configuration.stall_timeout_seconds = 60.0
+          T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "generation")
+          @coordinator.define_singleton_method(:execute_script) { |**_kwargs| redis_call_made = true }
+
+          thread = T.cast(@coordinator.send(:start_production_heartbeat), Thread)
+          started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @coordinator.send(:stop_production_heartbeat, thread, propagate_error: true)
+
+          assert_operator(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at, :<, 0.5)
+          refute(redis_call_made)
+        end
+
         def test_production_heartbeat_retries_transient_connection_errors
           attempts = 0
           @coordinator.configuration.stall_timeout_seconds = 0.02
@@ -296,15 +310,26 @@ module Minitest
           shared_abort_called = T.let(false, T::Boolean)
           @coordinator.define_singleton_method(:attempt_superseded?) { false }
           @coordinator.define_singleton_method(:attempt_truncated?) { true }
-          @coordinator.define_singleton_method(:abort_locally_with_diagnostic) do |diagnostic|
-            local_diagnostic = diagnostic
-          end
+          @coordinator.define_singleton_method(:emit_message) { |diagnostic| local_diagnostic = diagnostic }
           @coordinator.define_singleton_method(:abort_with_diagnostic) { |*_args| shared_abort_called = true }
 
           @coordinator.send(:handle_coordinator_state_error, Redis::CommandError.new("NOGROUP missing group"))
 
           assert_includes(T.must(local_diagnostic), "another worker truncated the run")
+          assert_predicate(@coordinator, :aborted?)
+          assert_predicate(@coordinator, :current_attempt_truncated?)
+          assert_nil(@coordinator.stall_diagnostic)
           refute(shared_abort_called)
+        end
+
+        def test_stale_attempt_commit_does_not_reread_generation_before_discarding
+          T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "old-generation")
+          @coordinator.define_singleton_method(:execute_script) do |**_kwargs|
+            raise Redis::CommandError, "STALEATTEMPT expected generation old-generation"
+          end
+          @coordinator.define_singleton_method(:attempt_superseded?) { raise "generation was re-read" }
+
+          assert_empty(T.unsafe(@coordinator).send(:commit_results, []))
         end
 
         def test_wrongtype_error_is_not_suppressed_by_terminal_counters

@@ -199,6 +199,16 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_equal(101, results.runs)
   end
 
+  def test_nonterminal_aggregate_reader_rejects_partial_statistics
+    run_id = "test_nonterminal_aggregate_reader_rejects_partial_statistics"
+    @redis.set("minitest/v3/#{run_id}/runs", "0")
+    configuration = redis_configuration(run_id: run_id, worker_id: "reader")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+
+    error = T.unsafe(assert_raises(Redis::CommandError) { coordinator.combined_results })
+    assert_includes(error.message, "partial aggregate statistics")
+  end
+
   def test_terminal_aggregate_reader_rejects_missing_and_wrong_type_statistics
     run_id = "test_terminal_aggregate_reader_rejects_missing_and_wrong_type_statistics"
     worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
@@ -230,11 +240,17 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
         output,
         { distributed: configuration, args: [] },
       )
+      summary.start
       assert_predicate(summary, :passed?)
 
       @redis.del("minitest/v3/#{run_id}/production_complete")
 
       refute_predicate(summary, :passed?)
+      summary.report
+      output.rewind
+      summary_output = output.read
+      assert_includes(summary_output, "terminal coordinator state is invalid")
+      refute_includes(T.unsafe(summary_output), "Results:")
     end
   end
 
@@ -401,6 +417,55 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     refute(@redis.exists?("minitest/v3/#{run_id}/stalled"))
   end
 
+  def test_commit_rejects_inconsistent_aggregate_and_negative_assertions_before_ack
+    run_id = "test_commit_rejects_inconsistent_aggregate_and_negative_assertions_before_ack"
+    fixture_class = T.let(Class.new(Minitest::Test), T.class_of(Minitest::Test))
+    fixture_class.send(:define_method, :test_passes) {}
+    T.unsafe(Object).const_set(:CommitValidationFixture, fixture_class)
+    runnable = fixture_class.new(:test_passes)
+    selector = empty_test_selector
+    selector.define_singleton_method(:tests) { [runnable] }
+
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: selector)
+    claims = T.cast(
+      T.unsafe(coordinator).send(:claim_fresh_runnables, block: 1),
+      T::Array[Minitest::Distributed::EnqueuedRunnable],
+    )
+    result = claims.fetch(0).instantiate_runnable.run
+    @redis.set("minitest/v3/#{run_id}/runs", "1")
+
+    aggregate_error = T.unsafe(assert_raises(Redis::CommandError) do
+      T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
+    end)
+    assert_includes(aggregate_error.message, "inconsistent aggregate statistics")
+    assert_equal("0", @redis.get("minitest/v3/#{run_id}/acks"))
+
+    @redis.set("minitest/v3/#{run_id}/runs", "0")
+    result.assertions = -1
+    payload_error = T.unsafe(assert_raises(Redis::CommandError) do
+      T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
+    end)
+    assert_includes(payload_error.message, "invalid result payload")
+    assert_equal("0", @redis.get("minitest/v3/#{run_id}/acks"))
+
+    capture_io { T.unsafe(coordinator).send(:abort_with_diagnostic, "superseded for test") }
+    replacement_configuration = redis_configuration(run_id: run_id, worker_id: "replacement")
+    replacement = T.cast(
+      replacement_configuration.coordinator,
+      Minitest::Distributed::Coordinators::RedisCoordinator,
+    )
+    replacement.produce(test_selector: empty_test_selector)
+    result.assertions = 0
+    discarded = T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
+    assert_predicate(discarded.fetch(0).commit, :failure?)
+  ensure
+    T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
+    T.unsafe(replacement).send(:cleanup) if defined?(replacement) && replacement
+    T.unsafe(Object).send(:remove_const, :CommitValidationFixture) if Object.const_defined?(:CommitValidationFixture)
+  end
+
   def test_commit_after_truncation_marker_does_not_ack_or_complete_the_run
     run_id = "test_commit_after_truncation_marker_does_not_ack_or_complete_the_run"
     fixture_class = T.let(Class.new(Minitest::Test), T.class_of(Minitest::Test))
@@ -428,6 +493,18 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_equal("1", @redis.get("minitest/v3/#{run_id}/truncated"))
     refute(@redis.exists?("minitest/v3/#{run_id}/completed_at"))
     refute(@redis.exists?("minitest/v3/#{run_id}/retry_snapshot_digest"))
+    Tempfile.create("truncated-summary") do |output|
+      summary = Minitest::Distributed::Reporters::DistributedSummaryReporter.new(
+        output,
+        { distributed: configuration, args: [] },
+      )
+      summary.start
+      summary.report
+      output.rewind
+      summary_output = output.read
+      assert_includes(summary_output, "another worker reached the max-failures limit")
+      refute_includes(T.unsafe(summary_output), "previous attempt")
+    end
 
     truncated_generation = String(@redis.get("minitest/v3/#{run_id}/attempt_generation"))
     @redis.expire("minitest/v3/#{run_id}/truncated_generation", 1)
@@ -441,11 +518,9 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_predicate(replacement, :aborted?)
     assert_operator(@redis.ttl("minitest/v3/#{run_id}/truncated_generation"), :>, 60)
 
-    stale_error = T.unsafe(assert_raises(Redis::CommandError) do
-      T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
-    end)
-    capture_io { T.unsafe(coordinator).send(:handle_coordinator_state_error, stale_error) }
-    assert_includes(T.must(coordinator.stall_diagnostic), "another worker truncated the run")
+    discarded_after_takeover = T.unsafe(coordinator).send(:commit_results, [[claims.fetch(0), result]])
+    assert_predicate(discarded_after_takeover.fetch(0).commit, :failure?)
+    assert_predicate(coordinator, :current_attempt_truncated?)
     refute(@redis.exists?("minitest/v3/#{run_id}/stalled"))
 
     follower_configuration = redis_configuration(run_id: run_id, worker_id: "truncated-follower")
@@ -530,6 +605,28 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
   ensure
     leader_thread&.kill
     leader_thread&.join
+  end
+
+  def test_runtime_retention_mismatch_uses_coordinator_diagnostic
+    run_id = "test_runtime_retention_mismatch_uses_coordinator_diagnostic"
+    worker_thread = spawn_redis_worker(
+      test_file: "paced_passing_tests.rb",
+      run_id: run_id,
+      timeout: 5,
+      arguments: { "--test-batch-size" => "1" },
+    )
+    acks_key = "minitest/v3/#{run_id}/acks"
+    wait_until("the worker acknowledges a test") do
+      acks = @redis.get(acks_key)
+      !acks.nil? && Integer(acks).between?(1, 19)
+    end
+    @redis.set("minitest/v3/#{run_id}/retention_ttl", "1", ex: 30)
+
+    worker = worker_thread.value
+    refute_worker_successful(worker)
+    assert_output_includes(worker, "lost required Redis coordinator state")
+    assert_output_includes(worker, "COORDINATORCONFIG")
+    refute_includes(worker.stdout, "Redis::CommandError")
   end
 
   def test_native_wrongtype_from_direct_stream_commands_fails_closed

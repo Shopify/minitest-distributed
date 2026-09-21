@@ -58,6 +58,13 @@ module Minitest
         end
         private_constant :StallProbe
 
+        class HeartbeatControl < T::Struct
+          const :mutex, Mutex, factory: -> { Mutex.new }
+          const :condition, ConditionVariable, factory: -> { ConditionVariable.new }
+          prop :stop_requested, T::Boolean, default: false
+        end
+        private_constant :HeartbeatControl
+
         sig { returns(Configuration) }
         attr_reader :configuration
 
@@ -98,12 +105,15 @@ module Minitest
           @group_name = T.let(BASE_GROUP_NAME, String)
           @attempt_generation = T.let(nil, T.nilable(String))
           @production_heartbeat_error = T.let(nil, T.nilable(StandardError))
+          @production_heartbeat_control = T.let(nil, T.nilable(HeartbeatControl))
           @mutating_script_mutex = T.let(Mutex.new, Mutex)
           @local_results = T.let(ResultAggregate.new, ResultAggregate)
           @combined_results = T.let(nil, T.nilable(ResultAggregate))
           @combined_results_production_complete = T.let(nil, T.nilable(T::Boolean))
           @attempt_truncated = T.let(false, T::Boolean)
           @truncated_follower = T.let(false, T::Boolean)
+          @retry_refused_due_to_truncation = T.let(false, T::Boolean)
+          @truncation_state_invalid = T.let(false, T::Boolean)
           @registration_rejected = T.let(false, T::Boolean)
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
@@ -178,6 +188,21 @@ module Minitest
           @registration_rejected
         end
 
+        sig { returns(T::Boolean) }
+        def retry_refused_due_to_truncation?
+          @retry_refused_due_to_truncation
+        end
+
+        sig { returns(T::Boolean) }
+        def current_attempt_truncated?
+          @attempt_truncated
+        end
+
+        sig { returns(T::Boolean) }
+        def truncation_state_invalid?
+          @truncation_state_invalid
+        end
+
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
           production_heartbeat_thread = T.let(nil, T.nilable(Thread))
@@ -225,6 +250,7 @@ module Minitest
             if registration_mode == -3
               @aborted = true
               @truncated_follower = true
+              @retry_refused_due_to_truncation = true
             elsif registration_mode == -4
               @aborted = true
               @registration_rejected = true
@@ -232,6 +258,14 @@ module Minitest
                 ERROR: minitest-distributed rejected a Redis key TTL change for an existing run.
                 run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
                 Active workers must use the same key TTL, and later retries cannot decrease the retained TTL.
+              ERROR
+            elsif registration_mode == -5
+              @aborted = true
+              @truncation_state_invalid = true
+              emit_message(<<~ERROR)
+                ERROR: minitest-distributed cannot retry because the retained truncation fence is incomplete.
+                run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
+                The run remains failed; restore or expire its retained state before reusing this run ID.
               ERROR
             end
             break unless registration_mode == -2
@@ -296,6 +330,7 @@ module Minitest
               tests_from_selector
             when 3 # The previous attempt intentionally stopped at max_failures.
               @aborted = true
+              @retry_refused_due_to_truncation = true
               adjust_combined_results(ResultAggregate.new(size: 0))
               []
             else
@@ -320,7 +355,7 @@ module Minitest
         # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
-          return if @truncated_follower || @registration_rejected
+          return if @truncated_follower || @registration_rejected || @truncation_state_invalid
 
           exponential_backoff = INITIAL_BACKOFF
           last_progress_at = monotonic_time
@@ -397,7 +432,11 @@ module Minitest
                 # Another worker may have completed the run while our memoized aggregate
                 # was stale. Treat the fresh counters as authoritative.
                 if probe.production_complete && !probe.acks.nil? && probe.acks == probe.size
-                  break
+                  # The probe checks completion/liveness fields only. Validate all
+                  # retained statistics and the same-snapshot production marker
+                  # before accepting terminal success.
+                  terminal_results = combined_results
+                  break if run_complete?(terminal_results)
                 end
 
                 counters_changed = probe.acks != observed_acks || probe.size != observed_size
@@ -480,6 +519,7 @@ module Minitest
             "COORDINATORSTATE",
             "COORDINATORSTREAM",
             "STALEATTEMPT",
+            "COORDINATORCONFIG",
           ) || ce.message.include?("no such key")
           if coordinator_state_error
             # A normal cleanup and missing/evicted state can produce similar Redis
@@ -570,7 +610,9 @@ module Minitest
               end
             end
 
-            if existing_count == 10 then
+            if existing_count > 0 and existing_count < 10 then
+              return redis.error_reply('COORDINATORSTATE partial aggregate statistics')
+            elseif existing_count == 10 then
               local runs = values[1]
               local reported = values[3] + values[4] + values[5] + values[6]
               if values[9] > values[10] or runs < values[7] + values[8] or
@@ -649,17 +691,21 @@ module Minitest
             local truncated, truncated_invalid = read_marker(KEYS[20])
             local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
             local truncated_generation = nil
+            local truncation_fence_invalid = false
             if truncated then
               if truncated_generation_type == 'string' then
                 truncated_generation = redis.call('GET', KEYS[23])
               else
-                truncated_invalid = true
+                truncation_fence_invalid = true
               end
             elseif truncated_generation_type ~= 'none' then
               truncated_invalid = true
             end
             if stalled_invalid or production_complete_invalid or truncated_invalid then
               invalid_active_state = true
+            end
+            if truncation_fence_invalid or (truncated and not current_generation) then
+              return {0, current_generation or '', -5, {}, {}}
             end
 
             local heartbeat_type = redis.call('TYPE', KEYS[5]).ok
@@ -724,6 +770,9 @@ module Minitest
               invalid_active_state = true
             end
             if not retained_ttl and (stream_exists or current_generation or existing_stat_count > 0) then
+              invalid_active_state = true
+            end
+            if existing_stat_count > 0 and not current_generation then
               invalid_active_state = true
             end
 
@@ -1033,6 +1082,12 @@ module Minitest
               end
               stat_values[stat_index] = value
             end
+            local runs = stat_values[1]
+            local reported = stat_values[3] + stat_values[4] + stat_values[5] + stat_values[6]
+            if stat_values[9] > stat_values[10] or runs < stat_values[7] + stat_values[8] or
+              runs - stat_values[7] - stat_values[8] ~= reported then
+              return redis.error_reply('COORDINATORSTATE inconsistent aggregate statistics')
+            end
 
             local truncated_type = redis.call('TYPE', KEYS[20]).ok
             local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
@@ -1070,7 +1125,7 @@ module Minitest
             for _ = 1, result_count do
               local result_type = ARGV[validation_index + 1]
               local assertions = tonumber(ARGV[validation_index + 4])
-              if not allowed_result_types[result_type] or not assertions or assertions % 1 ~= 0 then
+              if not allowed_result_types[result_type] or not assertions or assertions < 0 or assertions % 1 ~= 0 then
                 return redis.error_reply('COORDINATORSTATE invalid result payload')
               end
               assertion_total = assertion_total + assertions
@@ -1769,11 +1824,18 @@ module Minitest
         def start_production_heartbeat
           generation = T.must(@attempt_generation)
           interval = [configuration.stall_timeout_seconds / 2, MAX_PRODUCTION_HEARTBEAT_INTERVAL_SECONDS].min
+          control = HeartbeatControl.new
+          @production_heartbeat_control = control
           @production_heartbeat_error = nil
           Thread.new do
             Thread.current.report_on_exception = false
             loop do
-              sleep(interval)
+              stop_requested = control.mutex.synchronize do
+                control.condition.wait(control.mutex, interval) unless control.stop_requested
+                control.stop_requested
+              end
+              break if stop_requested
+
               begin
                 updated = execute_script(
                   script_name: :heartbeat,
@@ -1796,8 +1858,14 @@ module Minitest
 
         sig { params(thread: Thread, propagate_error: T::Boolean).void }
         def stop_production_heartbeat(thread, propagate_error:)
-          thread.kill
+          if (control = @production_heartbeat_control)
+            control.mutex.synchronize do
+              control.stop_requested = true
+              control.condition.broadcast
+            end
+          end
           thread.join
+          @production_heartbeat_control = nil
           heartbeat_error = @production_heartbeat_error
           raise heartbeat_error if heartbeat_error && propagate_error
         end
@@ -1889,7 +1957,9 @@ module Minitest
         sig { params(error: Redis::CommandError).void }
         def handle_coordinator_state_error(error)
           if attempt_truncated?
-            abort_locally_with_diagnostic(<<~DIAGNOSTIC)
+            @attempt_truncated = true
+            @aborted = true
+            emit_message(<<~DIAGNOSTIC)
               ERROR: minitest-distributed stopped this worker after another worker truncated the run.
               run_id=#{configuration.run_id} worker_id=#{configuration.worker_id}
               redis_error=#{error.message.inspect}
@@ -2237,7 +2307,15 @@ module Minitest
           update_combined_results(aggregate_response, production_complete: production_complete)
           build_runnable_results(results, commit_statuses)
         rescue Redis::CommandError => error
-          cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORSTREAM") ||
+          if error.message.start_with?("STALEATTEMPT")
+            # The Lua script already proved supersession atomically. Do not
+            # re-read generation or truncation keys here: they may be evicted
+            # before Ruby handles the response, but the executed batch must
+            # still be recorded locally as discarded.
+            return build_runnable_results(results, Array.new(results.size, 0))
+          end
+
+          cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORCONFIG", "COORDINATORSTREAM") ||
             error.message.include?("no such key")
           raise unless cleanup_race_error
 

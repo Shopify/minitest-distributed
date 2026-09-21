@@ -22,26 +22,37 @@ module Minitest
 
         sig { override.void }
         def report
-          print_discard_warning if local_results.discards > 0
+          print_discard_warning if local_results.discards > 0 && !current_attempt_truncated?
 
           if registration_rejected?
-            formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
-            io.puts("This worker: #{local_results} #{formatted_duration}")
-            io.puts("Combined results are unavailable because coordinator registration was rejected.")
+            print_local_results("Combined results are unavailable because coordinator registration was rejected.")
+            return
+          elsif truncation_state_invalid?
+            print_local_results("Combined results are unavailable because the retained truncation state is incomplete.")
+            return
+          elsif coordinator_stalled?
+            print_local_results("Combined results are unavailable because the Redis coordinator state is invalid.")
+            return
+          elsif retry_refused_due_to_truncation?
+            io.puts("Cannot retry a run that was cut short during the previous attempt.")
+            print_local_results("Combined results were not read for this rejected retry.")
+            return
+          elsif current_attempt_truncated?
+            io.puts("The run was cut short after another worker reached the max-failures limit.")
+            print_local_results("Combined results were not read after truncation.")
+            return
+          elsif configuration.coordinator.aborted?
+            print_local_results("Combined results are unavailable because the coordinator aborted this worker.")
             return
           end
 
-          if configuration.coordinator.aborted?
-            if coordinator_stalled?
-              formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
-              io.puts("This worker: #{local_results} #{formatted_duration}")
-              io.puts("Combined results are unavailable because the Redis coordinator state is invalid.")
-              return
-            end
+          @combined_results = nil
+          unless configuration.coordinator.valid_combined_results?
+            print_local_results("Combined results are unavailable because terminal coordinator state is invalid.")
+            return
+          end
 
-            io.puts("Cannot retry a run that was cut short during the previous attempt.")
-            io.puts
-          elsif combined_results.abort?
+          if combined_results.abort?
             io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
             io.puts
           end
@@ -69,6 +80,13 @@ module Minitest
 
         protected
 
+        sig { params(message: String).void }
+        def print_local_results(message)
+          formatted_duration = format("(in %0.3fs)", Minitest.clock_time - @start_time)
+          io.puts("This worker: #{local_results} #{formatted_duration}")
+          io.puts(message)
+        end
+
         sig { void }
         def print_discard_warning
           io.puts(<<~WARNING)
@@ -83,6 +101,24 @@ module Minitest
         def registration_rejected?
           coordinator = T.unsafe(configuration.coordinator)
           coordinator.respond_to?(:registration_rejected?) && !!coordinator.registration_rejected?
+        end
+
+        sig { returns(T::Boolean) }
+        def truncation_state_invalid?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:truncation_state_invalid?) && !!coordinator.truncation_state_invalid?
+        end
+
+        sig { returns(T::Boolean) }
+        def retry_refused_due_to_truncation?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:retry_refused_due_to_truncation?) && !!coordinator.retry_refused_due_to_truncation?
+        end
+
+        sig { returns(T::Boolean) }
+        def current_attempt_truncated?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:current_attempt_truncated?) && !!coordinator.current_attempt_truncated?
         end
 
         sig { returns(T::Boolean) }
