@@ -64,7 +64,7 @@ module Minitest
           # encountered a failed test. We trust that the other worker will do this correctly,
           # but we do verify that the statistics for the complete run are valid,
           # to have some protection against unknown edge cases and bugs.
-          local_results.passed? && combined_results.valid?
+          local_results.passed? && configuration.coordinator.valid_combined_results?
         end
 
         protected

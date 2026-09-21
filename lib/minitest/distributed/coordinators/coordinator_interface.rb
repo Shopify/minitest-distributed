@@ -21,6 +21,9 @@ module Minitest
         sig { abstract.returns(T::Boolean) }
         def aborted?; end
 
+        sig { abstract.returns(T::Boolean) }
+        def valid_combined_results?; end
+
         sig { abstract.params(test_selector: TestSelector).void }
         def produce(test_selector:); end
 

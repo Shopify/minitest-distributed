@@ -39,6 +39,11 @@ module Minitest
           @aborted
         end
 
+        sig { override.returns(T::Boolean) }
+        def valid_combined_results?
+          combined_results.valid?
+        end
+
         sig { override.params(test_selector: TestSelector).void }
         def produce(test_selector:)
           if @leader.try_lock

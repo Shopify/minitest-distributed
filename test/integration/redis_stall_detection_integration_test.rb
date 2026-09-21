@@ -218,6 +218,26 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     assert_includes(error.message, "invalid statistic type")
   end
 
+  def test_summary_does_not_pass_after_production_complete_is_lost
+    run_id = "test_summary_does_not_pass_after_production_complete_is_lost"
+    configuration = redis_configuration(run_id: run_id, worker_id: "worker")
+    coordinator = T.cast(configuration.coordinator, Minitest::Distributed::Coordinators::RedisCoordinator)
+    coordinator.produce(test_selector: empty_test_selector)
+    coordinator.consume(reporter: Minitest::CompositeReporter.new)
+
+    Tempfile.create("distributed-summary") do |output|
+      summary = Minitest::Distributed::Reporters::DistributedSummaryReporter.new(
+        output,
+        { distributed: configuration, args: [] },
+      )
+      assert_predicate(summary, :passed?)
+
+      @redis.del("minitest/v3/#{run_id}/production_complete")
+
+      refute_predicate(summary, :passed?)
+    end
+  end
+
   def test_publish_rejects_negative_completion_counters
     run_id = "test_publish_rejects_negative_completion_counters"
     configuration = redis_configuration(run_id: run_id, worker_id: "worker")

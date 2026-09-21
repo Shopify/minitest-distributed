@@ -157,6 +157,17 @@ module Minitest
           @aborted
         end
 
+        sig { override.returns(T::Boolean) }
+        def valid_combined_results?
+          # Reporter success must be based on one fresh atomic snapshot. Counters
+          # alone can look complete after production_complete is evicted.
+          @combined_results = nil
+          results = combined_results
+          results.valid? && @combined_results_production_complete == true
+        rescue Redis::BaseError, CoordinatorStateError
+          false
+        end
+
         sig { returns(T::Boolean) }
         def stalled?
           !stall_diagnostic.nil?
