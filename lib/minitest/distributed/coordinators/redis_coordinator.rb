@@ -301,18 +301,29 @@ module Minitest
 
         sig { returns(String) }
         def register_consumergroup_script
-          @register_consumergroup_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
-            -- Try to create the consumergroup. This will raise an error if the
-            -- consumergroup has already been registered by somebody else, which
-            -- means another worker will be acting as leader.
-            -- In that case, the next Redis DEL call will not be executed.
-            redis.call('XGROUP', 'CREATE', KEYS[1], ARGV[1], '0', 'MKSTREAM')
+          attempts = 0
+          begin
+            attempts += 1
+            @register_consumergroup_script ||= T.let(redis.script(:load, <<~LUA), T.nilable(String))
+              -- Try to create the consumergroup. This will raise an error if the
+              -- consumergroup has already been registered by somebody else, which
+              -- means another worker will be acting as leader.
+              -- In that case, the next Redis DEL call will not be executed.
+              redis.call('XGROUP', 'CREATE', KEYS[1], ARGV[1], '0', 'MKSTREAM')
 
-            -- The leader should reset the size and acks key for this run attempt.
-            -- We return the number of keys that were deleted, which can be used to
-            -- determine whether this was the first attempt for this run or not.
-            return redis.call('DEL', KEYS[2], KEYS[3])
-          LUA
+              -- The leader should reset the size and acks key for this run attempt.
+              -- We return the number of keys that were deleted, which can be used to
+              -- determine whether this was the first attempt for this run or not.
+              return redis.call('DEL', KEYS[2], KEYS[3])
+            LUA
+          rescue Redis::CannotConnectError
+            raise if attempts >= SCRIPT_LOAD_MAX_ATTEMPTS
+
+            # SCRIPT LOAD is idempotent and runs before the queue-mutating EVAL,
+            # so reconnecting here cannot replay a partially applied test update.
+            sleep(SCRIPT_LOAD_RETRY_DELAY)
+            retry
+          end
         end
 
         sig { params(block: Integer).returns(T::Array[EnqueuedRunnable]) }
@@ -559,6 +570,12 @@ module Minitest
 
         INITIAL_BACKOFF = 10 # milliseconds
         private_constant :INITIAL_BACKOFF
+
+        SCRIPT_LOAD_MAX_ATTEMPTS = 3
+        private_constant :SCRIPT_LOAD_MAX_ATTEMPTS
+
+        SCRIPT_LOAD_RETRY_DELAY = 1 # second
+        private_constant :SCRIPT_LOAD_RETRY_DELAY
 
         # Cap on the XREADGROUP BLOCK timeout used by `consume`. Reached after roughly
         # 9 consecutive empty iterations (10 ms * 2^9 = 5120 ms). Bounds the worst-case

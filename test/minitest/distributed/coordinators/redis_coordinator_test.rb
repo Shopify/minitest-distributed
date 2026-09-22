@@ -12,6 +12,8 @@ module Minitest
         # value (e.g. MAX_BACKOFF moves up or down) will fail those tests.
         EXPECTED_INITIAL_BACKOFF = 10 # milliseconds
         EXPECTED_MAX_BACKOFF = 5_000 # milliseconds
+        EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS = 3
+        EXPECTED_SCRIPT_LOAD_RETRY_DELAY = 1 # second
 
         def setup
           @coordinator = RedisCoordinator.new(
@@ -95,6 +97,66 @@ module Minitest
             :<=,
             20,
             "Expected the backoff to cap within ~20 doublings; got #{iterations}",
+          )
+        end
+
+        def test_register_consumergroup_script_retries_connection_failures
+          attempts = 0
+          redis = Object.new
+          redis.define_singleton_method(:script) do |_command, _script|
+            attempts += 1
+            raise Redis::CannotConnectError, "connection timed out" if attempts < EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS
+
+            "script-sha"
+          end
+          sleeps = []
+
+          @coordinator.define_singleton_method(:redis) { redis }
+          @coordinator.define_singleton_method(:sleep) { |delay| sleeps << delay }
+
+          assert_equal("script-sha", @coordinator.send(:register_consumergroup_script))
+          assert_equal(EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS, attempts)
+          assert_equal(
+            [EXPECTED_SCRIPT_LOAD_RETRY_DELAY] * (EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS - 1),
+            sleeps,
+          )
+        end
+
+        def test_register_consumergroup_script_does_not_retry_read_timeouts
+          attempts = 0
+          redis = Object.new
+          redis.define_singleton_method(:script) do |_command, _script|
+            attempts += 1
+            raise Redis::TimeoutError, "read timed out"
+          end
+
+          @coordinator.define_singleton_method(:redis) { redis }
+
+          assert_raises(Redis::TimeoutError) do
+            @coordinator.send(:register_consumergroup_script)
+          end
+          assert_equal(1, attempts)
+        end
+
+        def test_register_consumergroup_script_stops_retrying_connection_failures
+          attempts = 0
+          redis = Object.new
+          redis.define_singleton_method(:script) do |_command, _script|
+            attempts += 1
+            raise Redis::CannotConnectError, "connection timed out"
+          end
+          sleeps = []
+
+          @coordinator.define_singleton_method(:redis) { redis }
+          @coordinator.define_singleton_method(:sleep) { |delay| sleeps << delay }
+
+          assert_raises(Redis::CannotConnectError) do
+            @coordinator.send(:register_consumergroup_script)
+          end
+          assert_equal(EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS, attempts)
+          assert_equal(
+            [EXPECTED_SCRIPT_LOAD_RETRY_DELAY] * (EXPECTED_SCRIPT_LOAD_MAX_ATTEMPTS - 1),
+            sleeps,
           )
         end
       end
