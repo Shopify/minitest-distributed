@@ -81,12 +81,42 @@ them to fail.
 - `--worker-id=IDENTIFIER` or `ENV[MINITEST_WORKER_ID]`: The ID of the worker,
   which should be unique to the cluster. We will default to a UUID if this is
   not set, which generally is fine.
+- `--key-ttl=SECONDS` or `ENV[MINITEST_KEY_TTL_SECONDS]` (default: 86400, i.e.
+  24 hours). The expiry applied to every Redis key a run owns, refreshed on
+  every write. A run's statistics deliberately outlive the run itself so retry
+  mode can read them, and this is what eventually reclaims them. Raise it if you
+  retry runs more than a day later. Once these keys expire, a later invocation
+  with the same run ID performs a full run rather than a selective retry. Do not
+  set it below the duration of a run: required state expiring mid-run aborts the
+  run to avoid reporting incomplete results. Active workers must use the same
+  TTL. A later retry may increase the retained run's TTL, but cannot decrease it
+  while that state exists, because doing so could invalidate another worker's
+  completion-grace wait.
+- `--stall-timeout=SECONDS` or `ENV[MINITEST_STALL_TIMEOUT_SECONDS]` (default:
+  300, i.e. 5 minutes). After this long without processing a batch or observing
+  the run counters change, inspect the Redis stream. If it has no pending or
+  undelivered tests but `acks` does not equal `size`, abort with a diagnostic
+  instead of waiting silently forever. A producer heartbeat keeps slow test
+  discovery from being mistaken for a stall. Keep this comfortably above the
+  normal end-of-run wait for your suite.
+- `--completion-grace=SECONDS` or `ENV[MINITEST_COMPLETION_GRACE_SECONDS]`
+  (default: 30). Before reusing a recently completed run ID, wait this long for
+  late workers from the previous cohort to finish. The key TTL must exceed this
+  grace period by at least one second so the retained retry snapshot cannot
+  expire while a worker is waiting. Lower this only when your CI guarantees
+  tighter worker-start synchronization.
 - `--exclude-file=PATH_TO_FILE`: Specify a file of tests to be excluded
   from running. The file should include test identifiers seperated by
   newlines.
 - `--include-file=PATH_TO_FILE`: Specify a file of tests to be included in
   the test run. The file should include test identifiers seperated by
   newlines.
+
+Version 0.3 uses the versioned Redis namespace `minitest/v3/...`; it does not
+share streams or counters with the legacy 0.2 protocol. All workers in one
+cohort should still use the same gem version. Mixed-version cohorts run in
+separate namespaces and can duplicate test execution, but cannot mutate each
+other's coordinator state.
 
 **Limitations**
 

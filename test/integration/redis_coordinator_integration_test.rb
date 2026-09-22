@@ -41,6 +41,19 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     assert_equal(0, results.skips)
   end
 
+  def test_no_tests_with_multiple_workers_waits_for_production
+    workers = spawn_redis_workers(
+      count: 3,
+      test_file: "no_tests.rb",
+      run_id: "test_no_tests_with_multiple_workers_waits_for_production",
+    ).map(&:value)
+
+    assert_all_workers_successful(workers)
+    results = combined_results(run_id: "test_no_tests_with_multiple_workers_waits_for_production")
+    assert_predicate(results, :complete?)
+    assert_equal(0, results.size)
+  end
+
   def test_passing_tests_with_one_worker
     runner = spawn_redis_worker(
       test_file: "passing_tests.rb",
@@ -321,6 +334,7 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     # Once one worker decided to abort the run, the other workers will complete their tests
     # that are in progress before they will exit, increasing the number of failures.
     assert_operator(results.failures, :>=, 10)
+    refute(@redis.exists?("minitest/v3/test_max_failures_with_multiple_workers/stalled"))
   end
 
   def test_with_progress
@@ -342,6 +356,18 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
     assert_includes(output, "/100] PassingTests#test_pass_99")
   end
 
+  def test_versioned_protocol_namespace_does_not_mutate_legacy_state
+    run_id = "test_versioned_protocol_namespace_does_not_mutate_legacy_state"
+    legacy_queue = "minitest/#{run_id}/queue"
+    @redis.set(legacy_queue, "legacy-v2-state")
+
+    worker = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+
+    assert_worker_successful(worker)
+    assert_equal("legacy-v2-state", @redis.get(legacy_queue))
+    assert_equal("100", @redis.get("minitest/v3/#{run_id}/size"))
+  end
+
   def test_with_redis_log
     # When we boot workers in our test suite, we pipe the output. As a result, STDOUT is
     # not a TTY, and by default progress reporting is disabled. This has caused issues in
@@ -360,8 +386,8 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
 
       log = File.read(T.must(f.path))
       assert_includes(log, "xpending")
-      assert_includes(log, "mget")
-      assert_includes(log, "xack")
+      assert_includes(log, "xreadgroup")
+      assert_includes(log, "evalsha")
     end
   end
 end
