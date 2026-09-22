@@ -46,13 +46,17 @@ module Minitest
             return
           end
 
+          persisted_truncation = configuration.coordinator.persisted_truncation?
           @combined_results = nil
           unless configuration.coordinator.valid_combined_results?
+            if persisted_truncation
+              io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
+            end
             print_local_results("Combined results are unavailable because terminal coordinator state is invalid.")
             return
           end
 
-          if configuration.coordinator.persisted_truncation?
+          if persisted_truncation
             io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
             io.puts
           end
