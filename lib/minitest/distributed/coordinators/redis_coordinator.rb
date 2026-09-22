@@ -178,6 +178,18 @@ module Minitest
           false
         end
 
+        sig { override.returns(T::Boolean) }
+        def persisted_truncation?
+          truncated_key = key("truncated")
+          generation_key = key("truncated_generation")
+          return false unless redis.type(truncated_key) == "string"
+          return false unless redis.type(generation_key) == "string"
+
+          redis.get(truncated_key) == "1" && !redis.get(generation_key).to_s.empty?
+        rescue Redis::BaseError
+          false
+        end
+
         sig { returns(T::Boolean) }
         def stalled?
           !stall_diagnostic.nil?
@@ -277,7 +289,7 @@ module Minitest
 
           previous_failures = T.cast(registration.fetch(3), T::Array[String])
           previous_errors = T.cast(registration.fetch(4), T::Array[String])
-          production_heartbeat_thread = start_production_heartbeat
+          production_heartbeat_thread = start_production_heartbeat unless registration_mode == 3
 
           tests = T.let(
             case registration_mode
@@ -331,7 +343,6 @@ module Minitest
             when 3 # The previous attempt intentionally stopped at max_failures.
               @aborted = true
               @retry_refused_due_to_truncation = true
-              adjust_combined_results(ResultAggregate.new(size: 0))
               []
             else
               raise "Unknown Redis registration mode: #{registration_mode}"
@@ -339,8 +350,10 @@ module Minitest
             T::Array[Minitest::Runnable],
           )
 
-          publish_tests(tests)
-          propagate_heartbeat_error = true
+          unless @retry_refused_due_to_truncation
+            publish_tests(tests)
+            propagate_heartbeat_error = true
+          end
         ensure
           if production_heartbeat_thread
             stop_production_heartbeat(
@@ -355,7 +368,7 @@ module Minitest
         # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
-          return if @truncated_follower || @registration_rejected || @truncation_state_invalid
+          return if @retry_refused_due_to_truncation || @registration_rejected || @truncation_state_invalid
 
           exponential_backoff = INITIAL_BACKOFF
           last_progress_at = monotonic_time
@@ -896,10 +909,10 @@ module Minitest
               previous_errors = {}
             else
               redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[21], KEYS[22])
-              if mode == 1 or mode == 3 then
+              if mode == 1 then
                 redis.call('SET', KEYS[15], 0, 'EX', ARGV[2])
                 redis.call('SET', KEYS[16], 0, 'EX', ARGV[2])
-              else
+              elseif mode ~= 3 then
                 redis.call('DEL', KEYS[15], KEYS[16])
               end
               if mode == 3 then
@@ -910,9 +923,11 @@ module Minitest
             local generation = ARGV[4]
             redis.call('SET', KEYS[2], generation, 'EX', ARGV[2])
             redis.call('SET', KEYS[24], requested_ttl, 'EX', requested_ttl)
-            local group_name = ARGV[1] .. '-' .. generation
-            redis.call('XGROUP', 'CREATE', KEYS[1], group_name, '0', 'MKSTREAM')
-            redis.call('SET', KEYS[5], 0, 'EX', ARGV[2])
+            if mode ~= 3 then
+              local group_name = ARGV[1] .. '-' .. generation
+              redis.call('XGROUP', 'CREATE', KEYS[1], group_name, '0', 'MKSTREAM')
+              redis.call('SET', KEYS[5], 0, 'EX', ARGV[2])
+            end
             -- Retained state may come from an attempt with a shorter TTL. Align
             -- every surviving key with this generation before returning so a
             -- mode-3 follower cannot lose its truncation discriminator between
@@ -2312,7 +2327,7 @@ module Minitest
             # re-read generation or truncation keys here: they may be evicted
             # before Ruby handles the response, but the executed batch must
             # still be recorded locally as discarded.
-            return build_runnable_results(results, Array.new(results.size, 0))
+            return build_runnable_results(results, Array.new(results.size, 0), force_discard: true)
           end
 
           cleanup_race_error = error.message.start_with?("NOGROUP", "COORDINATORCONFIG", "COORDINATORSTREAM") ||
@@ -2328,23 +2343,29 @@ module Minitest
           terminal_results = combined_results
           raise unless run_complete?(terminal_results)
 
-          build_runnable_results(results, Array.new(results.size, 0))
+          build_runnable_results(results, Array.new(results.size, 0), force_discard: true)
         end
 
         sig do
           params(
             results: T::Array[[EnqueuedRunnable, Minitest::Result]],
             commit_statuses: T::Array[Integer],
+            force_discard: T::Boolean,
           ).returns(T::Array[EnqueuedRunnable::Result])
         end
-        def build_runnable_results(results, commit_statuses)
+        def build_runnable_results(results, commit_statuses, force_discard: false)
           results.each_with_index.map do |(enqueued_runnable, result), index|
             commit = if commit_statuses.fetch(index) == 1
               EnqueuedRunnable::Result::Commit.success
             else
               EnqueuedRunnable::Result::Commit.failure
             end
-            enqueued_runnable.commit_result(result) { |_result_to_commit| commit }
+            EnqueuedRunnable::Result.new(
+              enqueued_runnable: enqueued_runnable,
+              initial_result: result,
+              commit: commit,
+              force_discard: force_discard,
+            )
           end
         end
 

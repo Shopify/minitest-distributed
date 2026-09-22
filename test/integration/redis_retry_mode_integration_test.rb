@@ -532,6 +532,7 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
 
     assert_worker_successful(worker2)
     refute(@redis.exists?("minitest/v3/#{run_id}/truncated"))
+    refute_includes(worker2.stdout, "The run was cut short")
   end
 
   def test_incomplete_truncation_fence_rejects_retry_without_erasing_marker
@@ -569,6 +570,33 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(100, combined_results(run_id: run_id).size)
   end
 
+  def test_lost_mode3_fence_cannot_turn_incomplete_run_into_selective_retry
+    run_id = "test_lost_mode3_fence_cannot_turn_incomplete_run_into_selective_retry"
+    worker1 = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--no-retry-failures" => "true", "--max-failures" => "10" },
+    ).value
+    refute_worker_successful(worker1)
+
+    refused_retry = spawn_redis_worker(
+      test_file: "only_failures.rb",
+      run_id: run_id,
+      arguments: { "--retry-failures" => "true", "--max-failures" => "10" },
+    ).value
+    refute_worker_successful(refused_retry)
+    refute(@redis.exists?("minitest/v3/#{run_id}/production_complete"))
+    assert_equal("100", @redis.get("minitest/v3/#{run_id}/size"))
+
+    @redis.del("minitest/v3/#{run_id}/truncated", "minitest/v3/#{run_id}/truncated_generation")
+    worker3 = spawn_redis_worker(test_file: "only_failures.rb", run_id: run_id).value
+    refute_worker_successful(worker3)
+    assert_output_includes(worker3, "Running the full test suite instead of a selective retry")
+    results = combined_results(run_id: run_id)
+    assert_equal(100, results.size)
+    assert_equal(0, results.requeues)
+  end
+
   def test_retry_attempt_on_run_that_was_cut_short
     # When we the initial attempt is cut short because we reach the maximum number
     # of failures, we have to decide what to do when a retry is attempted.
@@ -601,10 +629,11 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     refute_worker_successful(worker2)
     assert_includes(worker2.stdout, "Cannot retry a run that was cut short during the previous attempt.")
 
-    # The combined results of the run are maintained, but the size of the second attempt was 0.
+    # The retained incomplete counters remain unchanged; mode 3 does not
+    # manufacture a completed 0/0 attempt that could become selectively retryable.
     new_results = combined_results(run_id: "test_retry_attempt_on_run_that_was_cut_short")
     refute_predicate(new_results, :passed?)
-    assert_equal(0, new_results.size)
+    assert_equal(100, new_results.size)
     assert_equal(0, new_results.passes)
     assert_equal(10, new_results.failures)
     assert_equal(0, new_results.requeues)

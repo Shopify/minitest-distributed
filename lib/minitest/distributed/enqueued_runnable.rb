@@ -85,6 +85,7 @@ module Minitest
         const :enqueued_runnable, EnqueuedRunnable
         const :initial_result, Minitest::Result
         const :commit, Commit
+        const :force_discard, T::Boolean, default: false
 
         sig { returns(String) }
         def entry_id
@@ -104,7 +105,7 @@ module Minitest
         sig { returns(Minitest::Result) }
         def committed_result
           @committed_result ||= T.let(
-            if final? && commit.failure?
+            if force_discard || (final? && commit.failure?)
               # If a runnable result is final, but the acked failed, we will discard the result.
               Minitest::Discard.wrap(
                 initial_result,

@@ -233,7 +233,7 @@ module Minitest
         end
 
         def test_truncated_follower_skips_the_consumer_loop
-          T.unsafe(@coordinator).instance_variable_set(:@truncated_follower, true)
+          T.unsafe(@coordinator).instance_variable_set(:@retry_refused_due_to_truncation, true)
           @coordinator.define_singleton_method(:claim_stale_runnables) { raise "consumer loop entered" }
 
           @coordinator.consume(reporter: Minitest::CompositeReporter.new)
@@ -322,14 +322,31 @@ module Minitest
           refute(shared_abort_called)
         end
 
-        def test_stale_attempt_commit_does_not_reread_generation_before_discarding
+        def test_stale_attempt_commit_discards_requeue_without_rereading_generation
           T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "old-generation")
           @coordinator.define_singleton_method(:execute_script) do |**_kwargs|
             raise Redis::CommandError, "STALEATTEMPT expected generation old-generation"
           end
           @coordinator.define_singleton_method(:attempt_superseded?) { raise "generation was re-read" }
+          enqueued = EnqueuedRunnable.new(
+            class_name: "Minitest::Test",
+            method_name: "test_example",
+            max_attempts: 3,
+            test_timeout_seconds: 1.0,
+          )
+          failure = Minitest::Result.new("test_example")
+          failure.failures = [Minitest::Assertion.new("failed")]
+          failure.time = 0.0
+          requeue = Minitest::Requeue.wrap(failure, attempt: 1, max_attempts: 3)
 
-          assert_empty(T.unsafe(@coordinator).send(:commit_results, []))
+          runnable_results = T.unsafe(@coordinator).send(:commit_results, [[enqueued, requeue]])
+          committed_result = runnable_results.fetch(0).committed_result
+          aggregate = ResultAggregate.new
+          aggregate.update_with_result(runnable_results.fetch(0))
+
+          assert_equal(ResultType::Discarded, ResultType.of(committed_result))
+          assert_equal(1, aggregate.discards)
+          assert_equal(0, aggregate.requeues)
         end
 
         def test_wrongtype_error_is_not_suppressed_by_terminal_counters

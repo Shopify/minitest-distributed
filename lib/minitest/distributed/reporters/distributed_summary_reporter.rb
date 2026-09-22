@@ -52,7 +52,7 @@ module Minitest
             return
           end
 
-          if combined_results.abort?
+          if configuration.coordinator.persisted_truncation?
             io.puts("The run was cut short after reaching the limit of #{configuration.max_failures} test failures.")
             io.puts
           end

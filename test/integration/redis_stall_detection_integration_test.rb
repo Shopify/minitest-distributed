@@ -533,7 +533,7 @@ class RedisStallDetectionIntegrationTest < RedisIntegrationTest
     follower.consume(reporter: Minitest::CompositeReporter.new)
     assert_operator(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at, :<, 0.1)
     assert_predicate(follower, :aborted?)
-    assert(@redis.exists?("minitest/v3/#{run_id}/queue"), "truncated follower cleaned up the replacement stream")
+    refute(@redis.exists?("minitest/v3/#{run_id}/queue"), "mode-3 retry created a completed replacement stream")
   ensure
     T.unsafe(coordinator).send(:cleanup) if defined?(coordinator) && coordinator
     T.unsafe(replacement).send(:cleanup) if defined?(replacement) && replacement
