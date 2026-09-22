@@ -115,6 +115,7 @@ module Minitest
           @retry_refused_due_to_truncation = T.let(false, T::Boolean)
           @truncation_state_invalid = T.let(false, T::Boolean)
           @registration_rejected = T.let(false, T::Boolean)
+          @superseded = T.let(false, T::Boolean)
           @reclaimed_timeout_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @reclaimed_failed_tests = T.let(Set.new, T::Set[EnqueuedRunnable])
           @aborted = T.let(false, T::Boolean)
@@ -213,6 +214,11 @@ module Minitest
         sig { returns(T::Boolean) }
         def truncation_state_invalid?
           @truncation_state_invalid
+        end
+
+        sig { returns(T::Boolean) }
+        def superseded?
+          @superseded
         end
 
         sig { override.params(test_selector: TestSelector).void }
@@ -351,8 +357,12 @@ module Minitest
           )
 
           unless @retry_refused_due_to_truncation
-            publish_tests(tests)
-            propagate_heartbeat_error = true
+            begin
+              publish_tests(tests)
+              propagate_heartbeat_error = true
+            rescue Redis::CommandError => error
+              raise unless handle_publish_race(error)
+            end
           end
         ensure
           if production_heartbeat_thread
@@ -368,7 +378,7 @@ module Minitest
         # rubocop:disable Metrics/BlockNesting, Lint/RedundantCopDisableDirective
         sig { override.params(reporter: AbstractReporter).void }
         def consume(reporter:)
-          return if @retry_refused_due_to_truncation || @registration_rejected || @truncation_state_invalid
+          return if @retry_refused_due_to_truncation || @registration_rejected || @truncation_state_invalid || superseded?
 
           exponential_backoff = INITIAL_BACKOFF
           last_progress_at = monotonic_time
@@ -388,12 +398,12 @@ module Minitest
             # First, see if there are any pending tests from other workers to claim.
             stale_runnables = claim_stale_runnables
             process_batch(stale_runnables, reporter)
-            break if commit_observed_truncation?
+            break if commit_observed_truncation? || superseded?
 
             # Then, try to process a regular batch of messages
             fresh_runnables = claim_fresh_runnables(block: exponential_backoff)
             process_batch(fresh_runnables, reporter)
-            break if commit_observed_truncation?
+            break if commit_observed_truncation? || superseded?
 
             run_results = combined_results
 
@@ -559,6 +569,31 @@ module Minitest
 
         private
 
+        sig { params(error: Redis::CommandError).returns(T::Boolean) }
+        def handle_publish_race(error)
+          expected_race = error.message.start_with?("NOGROUP", "COORDINATORSTREAM", "STALEATTEMPT") ||
+            error.message.include?("no such key")
+          return false unless expected_race
+
+          if error.message.start_with?("STALEATTEMPT")
+            @superseded = true
+            return true
+          end
+
+          if attempt_truncated?
+            @attempt_truncated = true
+            @aborted = true
+            return true
+          end
+
+          if attempt_superseded?
+            @superseded = true
+            return true
+          end
+
+          false
+        end
+
         sig { returns(Redis) }
         def redis
           @redis ||= Redis.new(
@@ -685,6 +720,10 @@ module Minitest
             local current_generation = nil
             if generation_type == 'string' then
               current_generation = redis.call('GET', KEYS[2])
+              if current_generation == '' then
+                current_generation = nil
+                invalid_active_state = true
+              end
             elseif generation_type ~= 'none' then
               invalid_active_state = true
             end
@@ -708,6 +747,10 @@ module Minitest
             if truncated then
               if truncated_generation_type == 'string' then
                 truncated_generation = redis.call('GET', KEYS[23])
+                if truncated_generation == '' then
+                  truncated_generation = nil
+                  truncation_fence_invalid = true
+                end
               else
                 truncation_fence_invalid = true
               end
@@ -1982,7 +2025,10 @@ module Minitest
             DIAGNOSTIC
             return
           end
-          return if attempt_superseded?
+          if attempt_superseded?
+            @superseded = true
+            return
+          end
 
           @combined_results = nil
           begin
@@ -2320,9 +2366,10 @@ module Minitest
             @aborted = true
           end
           update_combined_results(aggregate_response, production_complete: production_complete)
-          build_runnable_results(results, commit_statuses)
+          build_runnable_results(results, commit_statuses, force_discard: attempt_truncated)
         rescue Redis::CommandError => error
           if error.message.start_with?("STALEATTEMPT")
+            @superseded = true
             # The Lua script already proved supersession atomically. Do not
             # re-read generation or truncation keys here: they may be evicted
             # before Ruby handles the response, but the executed batch must

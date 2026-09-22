@@ -286,6 +286,25 @@ module Minitest
           end
         end
 
+        def test_publish_race_translates_truncation_and_supersession
+          @coordinator.define_singleton_method(:attempt_truncated?) { true }
+          truncated = @coordinator.send(
+            :handle_publish_race,
+            Redis::CommandError.new("COORDINATORSTREAM missing stream"),
+          )
+          assert(truncated)
+          assert_predicate(@coordinator, :current_attempt_truncated?)
+          assert_predicate(@coordinator, :aborted?)
+
+          replacement = RedisCoordinator.new(configuration: @coordinator.configuration)
+          superseded = replacement.send(
+            :handle_publish_race,
+            Redis::CommandError.new("STALEATTEMPT expected generation old"),
+          )
+          assert(superseded)
+          assert_predicate(replacement, :superseded?)
+        end
+
         def test_parse_redis_integer_rejects_negative_and_unsafe_values
           max_safe = 9_007_199_254_740_991
 
@@ -347,6 +366,42 @@ module Minitest
           assert_equal(ResultType::Discarded, ResultType.of(committed_result))
           assert_equal(1, aggregate.discards)
           assert_equal(0, aggregate.requeues)
+          assert_predicate(@coordinator, :superseded?)
+
+          @coordinator.local_results.failures = 1
+          T.unsafe(@coordinator.configuration).instance_variable_set(:@coordinator, @coordinator)
+          Tempfile.create("superseded-summary") do |output|
+            summary = Minitest::Distributed::Reporters::DistributedSummaryReporter.new(
+              output,
+              { distributed: @coordinator.configuration, args: [] },
+            )
+            assert_predicate(summary, :passed?)
+            summary.report
+            output.rewind
+            assert_includes(output.read, "local results do not affect the authoritative run")
+          end
+        end
+
+        def test_commit_side_truncation_forces_retryable_result_to_discard
+          T.unsafe(@coordinator).instance_variable_set(:@attempt_generation, "generation")
+          response = [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 100, 1, 1]
+          @coordinator.define_singleton_method(:execute_script) { |**_kwargs| response }
+          enqueued = EnqueuedRunnable.new(
+            class_name: "Minitest::Test",
+            method_name: "test_example",
+            max_attempts: 3,
+            test_timeout_seconds: 1.0,
+          )
+          failure = Minitest::Result.new("test_example")
+          failure.failures = [Minitest::Assertion.new("failed")]
+          failure.time = 0.0
+          requeue = Minitest::Requeue.wrap(failure, attempt: 1, max_attempts: 3)
+
+          runnable_results = T.unsafe(@coordinator).send(:commit_results, [[enqueued, requeue]])
+
+          assert_equal(ResultType::Discarded, ResultType.of(runnable_results.fetch(0).committed_result))
+          assert_predicate(@coordinator, :current_attempt_truncated?)
+          assert_predicate(@coordinator, :aborted?)
         end
 
         def test_wrongtype_error_is_not_suppressed_by_terminal_counters

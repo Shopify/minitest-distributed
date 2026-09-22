@@ -22,9 +22,12 @@ module Minitest
 
         sig { override.void }
         def report
-          print_discard_warning if local_results.discards > 0 && !current_attempt_truncated?
+          print_discard_warning if local_results.discards > 0 && !current_attempt_truncated? && !superseded?
 
-          if registration_rejected?
+          if superseded?
+            print_local_results("This worker was superseded; its local results do not affect the authoritative run.")
+            return
+          elsif registration_rejected?
             print_local_results("Combined results are unavailable because coordinator registration was rejected.")
             return
           elsif truncation_state_invalid?
@@ -72,6 +75,7 @@ module Minitest
 
         sig { override.returns(T::Boolean) }
         def passed?
+          return true if superseded?
           return false if configuration.coordinator.aborted?
 
           # Generally, we want the workers to fail that had at least one failed or errored
@@ -99,6 +103,12 @@ module Minitest
             take too long to run. Make sure that all your tests complete well within #{configuration.test_timeout_seconds}s.
 
           WARNING
+        end
+
+        sig { returns(T::Boolean) }
+        def superseded?
+          coordinator = T.unsafe(configuration.coordinator)
+          coordinator.respond_to?(:superseded?) && !!coordinator.superseded?
         end
 
         sig { returns(T::Boolean) }

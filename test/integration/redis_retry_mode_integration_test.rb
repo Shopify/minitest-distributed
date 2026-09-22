@@ -149,6 +149,19 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
     assert_equal(100, combined_results(run_id: run_id).size)
   end
 
+  def test_retry_with_blank_generation_runs_the_full_suite
+    run_id = "test_retry_with_blank_generation_runs_the_full_suite"
+    worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker1)
+
+    @redis.set("minitest/v3/#{run_id}/attempt_generation", "")
+
+    worker2 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
+    assert_worker_successful(worker2)
+    assert_output_includes(worker2, "Running the full test suite instead of a selective retry")
+    assert_equal(100, combined_results(run_id: run_id).size)
+  end
+
   def test_retry_with_invalid_generation_type_runs_the_full_suite
     run_id = "test_retry_with_invalid_generation_type_runs_the_full_suite"
     worker1 = spawn_redis_worker(test_file: "passing_tests.rb", run_id: run_id).value
@@ -543,7 +556,7 @@ class RedisRetryModeIntegrationTest < RedisIntegrationTest
       arguments: { "--no-retry-failures" => "true", "--max-failures" => "10" },
     ).value
     refute_worker_successful(worker1)
-    @redis.del("minitest/v3/#{run_id}/truncated_generation")
+    @redis.set("minitest/v3/#{run_id}/truncated_generation", "")
 
     worker2 = spawn_redis_worker(test_file: "only_failures.rb", run_id: run_id).value
     refute_worker_successful(worker2)
