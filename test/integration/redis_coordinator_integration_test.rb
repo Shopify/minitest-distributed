@@ -4,6 +4,63 @@
 require "test_helper"
 
 class RedisCoordinatorIntegrationTest < RedisIntegrationTest
+  def test_stale_worker_commit_is_discarded_after_another_worker_claims_entry
+    run_id = "test_stale_worker_commit_is_discarded"
+    test_name = name
+    test_class = self.class
+    test_selector = Minitest::Distributed::TestSelector.allocate
+    test_selector.define_singleton_method(:tests) { [test_class.new(test_name)] }
+    worker_a = Minitest::Distributed::Coordinators::RedisCoordinator.new(
+      configuration: Minitest::Distributed::Configuration.new(
+        coordinator_uri: URI(@redis_uri),
+        run_id: run_id,
+        worker_id: "worker-a",
+      ),
+    )
+    worker_b = Minitest::Distributed::Coordinators::RedisCoordinator.new(
+      configuration: Minitest::Distributed::Configuration.new(
+        coordinator_uri: URI(@redis_uri),
+        run_id: run_id,
+        worker_id: "worker-b",
+      ),
+    )
+
+    worker_a.produce(test_selector: test_selector)
+    worker_b.produce(test_selector: test_selector)
+    enqueued_runnable = worker_a.send(:claim_fresh_runnables, block: 1).fetch(0)
+    worker_b.send(:redis).xclaim(
+      worker_b.stream_key,
+      worker_b.group_name,
+      "worker-b",
+      0,
+      [enqueued_runnable.entry_id],
+    )
+
+    result = enqueued_runnable.instantiate_runnable
+    result.assertions = 1
+    result.time = 0.0
+    result.failures = []
+    stale_result = worker_a.send(:commit_results, [[enqueued_runnable, Minitest::Result.from(result)]]).fetch(0)
+
+    assert_equal(
+      Minitest::Distributed::ResultType::Discarded,
+      Minitest::Distributed::ResultType.of(stale_result.committed_result),
+    )
+    assert_equal(0, worker_a.combined_results.runs)
+    assert_equal(0, worker_a.combined_results.assertions)
+    assert_equal(0, worker_a.combined_results.acks)
+
+    committed_result = worker_b.send(:commit_results, [[enqueued_runnable, Minitest::Result.from(result)]]).fetch(0)
+
+    assert_equal(
+      Minitest::Distributed::ResultType::Passed,
+      Minitest::Distributed::ResultType.of(committed_result.committed_result),
+    )
+    assert_equal(1, worker_b.combined_results.runs)
+    assert_equal(1, worker_b.combined_results.assertions)
+    assert_equal(1, worker_b.combined_results.acks)
+  end
+
   def test_no_tests_with_read_timeout
     Toxiproxy[/redis/].downstream(:latency, latency: 100).apply do
       runner = spawn_redis_worker(
@@ -229,9 +286,8 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
   end
 
   def test_test_that_is_too_slow_with_limited_workers
-    # When we have fewer workers than retry attemmpts, at some point all workers
-    # will be trying to process the slow test, and there is no worker left to mark is as failed.
-    # As a result, the last worker will not be interruped and will be able to complete the run.
+    # Once every worker has timed out on this test, a stale execution must not
+    # override the final attempts-exhausted result.
     workers = spawn_redis_workers(
       count: 3,
       test_file: "slow_test.rb",
@@ -240,16 +296,17 @@ class RedisCoordinatorIntegrationTest < RedisIntegrationTest
       env: { "SLEEP_TIME" => "1" },
     ).map(&:value)
 
-    assert_all_workers_successful(workers)
+    assert_some_workers_failed(workers)
     output = workers_output(workers)
     assert_includes(output, "WARNING: The following tests were reclaimed from another worker:")
+    assert_includes(output, "This test takes too long to run (> 0.05s)")
 
     results = combined_results(run_id: "test_test_that_is_too_slow_with_limited_workers")
-    assert_predicate(results, :passed?)
+    refute_predicate(results, :passed?)
     assert_equal(100, results.acks)
     assert_equal(100, results.unique_runs)
-    assert_equal(100, results.passes)
-    assert_equal(0, results.failures)
+    assert_equal(99, results.passes)
+    assert_equal(1, results.failures)
     assert_equal(0, results.errors)
     assert_equal(0, results.skips)
   end

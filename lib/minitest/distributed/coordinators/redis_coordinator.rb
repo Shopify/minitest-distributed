@@ -1033,7 +1033,8 @@ module Minitest
           @commit_results_script ||= redis.script(:load, <<~LUA)
             local result_count = tonumber(ARGV[3])
             local expected_generation = ARGV[4]
-            local argument_index = 5
+            local worker_id = ARGV[5]
+            local argument_index = 6
             local commit_results = {}
             -- runs, assertions, passes, failures, errors, skips, requeues,
             -- discards, acks, size
@@ -1207,13 +1208,16 @@ module Minitest
               local assertions = tonumber(ARGV[argument_index + 4])
               argument_index = argument_index + 5
 
-              local committed
-              if result_type == 'requeued' then
-                committed = redis.call('SADD', KEYS[2], attempt_id)
-                deltas[7] = deltas[7] + 1
-              else
-                committed = redis.call('XACK', KEYS[1], ARGV[1], entry_id)
-                if committed == 1 then
+              local pending = redis.call('XPENDING', KEYS[1], ARGV[1], entry_id, entry_id, 1)
+              local committed = -1
+              if #pending > 0 and pending[1][2] == worker_id then
+                if result_type == 'requeued' then
+                  committed = redis.call('SADD', KEYS[2], attempt_id)
+                  deltas[7] = deltas[7] + 1
+                else
+                  committed = redis.call('XACK', KEYS[1], ARGV[1], entry_id)
+                end
+                if committed == 1 and result_type ~= 'requeued' then
                   deltas[9] = deltas[9] + 1
                   if result_type == 'passed' then
                     deltas[3] = deltas[3] + 1
@@ -1229,15 +1233,14 @@ module Minitest
                   elseif result_type == 'discarded' then
                     deltas[8] = deltas[8] + 1
                   end
-                else
+                elseif committed ~= 1 and result_type ~= 'requeued' then
                   -- Another worker already ACKed this entry, so the local result
                   -- will be reported as discarded.
                   deltas[8] = deltas[8] + 1
                 end
+                deltas[1] = deltas[1] + 1
+                deltas[2] = deltas[2] + assertions
               end
-
-              deltas[1] = deltas[1] + 1
-              deltas[2] = deltas[2] + assertions
               commit_results[result_index] = committed
             end
 
@@ -2328,7 +2331,7 @@ module Minitest
         end
         def commit_results(results)
           arguments = T.let(
-            [group_name, configuration.key_ttl_seconds, results.size, T.must(@attempt_generation)],
+            [group_name, configuration.key_ttl_seconds, results.size, T.must(@attempt_generation), configuration.worker_id],
             T::Array[T.untyped],
           )
           results.each do |enqueued_runnable, result|
@@ -2411,7 +2414,7 @@ module Minitest
               enqueued_runnable: enqueued_runnable,
               initial_result: result,
               commit: commit,
-              force_discard: force_discard,
+              force_discard: force_discard || commit_statuses.fetch(index) == -1,
             )
           end
         end
