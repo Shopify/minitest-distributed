@@ -1080,24 +1080,6 @@ module Minitest
               return redis.error_reply('COORDINATORCONFIG mismatched retention TTL')
             end
 
-            if redis.call('TYPE', KEYS[1]).ok ~= 'stream' then
-              return redis.error_reply('COORDINATORSTREAM missing or invalid key ' .. KEYS[1])
-            end
-            local groups = redis.pcall('XINFO', 'GROUPS', KEYS[1])
-            local group_exists = false
-            if not groups.err then
-              for _, group in ipairs(groups) do
-                for field_index = 1, #group, 2 do
-                  if group[field_index] == 'name' and group[field_index + 1] == ARGV[1] then
-                    group_exists = true
-                  end
-                end
-              end
-            end
-            if not group_exists then
-              return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[1])
-            end
-
             local retry_type = redis.call('TYPE', KEYS[2]).ok
             if retry_type ~= 'none' and retry_type ~= 'set' then
               return redis.error_reply('COORDINATORSTATE invalid retry set type')
@@ -1147,6 +1129,54 @@ module Minitest
               return redis.error_reply('COORDINATORSTATE inconsistent aggregate statistics')
             end
 
+            -- A receipt belongs to this generation and survives stream cleanup.
+            -- Compare the complete payload, not a digest, before returning the
+            -- original response. MessagePack preserves all safe integer counters.
+            local request_arguments = {}
+            for index = 1, 4 + result_count * 5 do
+              request_arguments[index] = ARGV[index]
+            end
+            local request = cmsgpack.pack(request_arguments)
+            local receipt_type = redis.call('TYPE', KEYS[25]).ok
+            if receipt_type ~= 'none' and receipt_type ~= 'string' then
+              return redis.error_reply('COORDINATORSTATE invalid commit receipt type')
+            end
+            if receipt_type == 'string' then
+              local valid, receipt = pcall(cmsgpack.unpack, redis.call('GET', KEYS[25]))
+              if not valid or type(receipt) ~= 'table' or type(receipt[2]) ~= 'table' then
+                return redis.error_reply('COORDINATORSTATE invalid commit receipt')
+              end
+              if receipt[1] ~= request then
+                return redis.error_reply('COORDINATORSTATE commit receipt payload mismatch')
+              end
+              return receipt[2]
+            end
+
+            -- After an ambiguous connection failure, absence is not proof that
+            -- the write never ran: its receipt may have expired or been lost.
+            -- Recovery may only return a retained receipt, never apply the batch.
+            if ARGV[#ARGV] == 'recover' then
+              return redis.error_reply('COORDINATORSTATE missing commit receipt during recovery')
+            end
+
+            if redis.call('TYPE', KEYS[1]).ok ~= 'stream' then
+              return redis.error_reply('COORDINATORSTREAM missing or invalid key ' .. KEYS[1])
+            end
+            local groups = redis.pcall('XINFO', 'GROUPS', KEYS[1])
+            local group_exists = false
+            if not groups.err then
+              for _, group in ipairs(groups) do
+                for field_index = 1, #group, 2 do
+                  if group[field_index] == 'name' and group[field_index + 1] == ARGV[1] then
+                    group_exists = true
+                  end
+                end
+              end
+            end
+            if not group_exists then
+              return redis.error_reply('COORDINATORSTREAM missing consumer group ' .. ARGV[1])
+            end
+
             local truncated_type = redis.call('TYPE', KEYS[20]).ok
             local truncated_generation_type = redis.call('TYPE', KEYS[23]).ok
             local truncated = false
@@ -1171,6 +1201,7 @@ module Minitest
               for key_index = 1, #KEYS do
                 redis.call('EXPIRE', KEYS[key_index], effective_ttl)
               end
+              redis.call('SET', KEYS[25], cmsgpack.pack({request, truncated_reply}), 'EX', effective_ttl)
               return truncated_reply
             end
 
@@ -1262,6 +1293,7 @@ module Minitest
               redis.call('EXPIRE', KEYS[key_index], effective_ttl)
             end
 
+            redis.call('SET', KEYS[25], cmsgpack.pack({request, reply}), 'EX', effective_ttl)
             return reply
           LUA
         end
@@ -2341,6 +2373,8 @@ module Minitest
             )
           end
 
+          arguments.push("commit")
+
           keys = [stream_key, key("retry_set")]
           keys.concat(STATS_KEY_NAMES.map { |name| key(name) })
           keys.concat(LIST_KEY_RESULT_TYPES.map { |result_type| list_key(result_type.serialize) })
@@ -2354,9 +2388,20 @@ module Minitest
             key("retry_snapshot_digest"),
             key("truncated_generation"),
             key("retention_ttl"),
+            key("commit_receipts/#{T.must(@attempt_generation)}/#{SecureRandom.uuid}"),
           )
 
-          response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
+          recoveries = 0
+          begin
+            response = T.unsafe(execute_script(script_name: :commit_results, keys: keys, argv: arguments))
+          rescue Redis::ConnectionError, Redis::TimeoutError
+            raise if recoveries >= 2
+
+            recoveries += 1
+            arguments[-1] = "recover"
+            sleep(0.1 * recoveries)
+            retry
+          end
           commit_statuses = T.cast(response.take(results.size), T::Array[Integer])
           aggregate_response = T.cast(response.drop(results.size), T::Array[Integer])
           attempt_truncated = aggregate_response.pop == 1

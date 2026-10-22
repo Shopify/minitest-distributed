@@ -118,6 +118,24 @@ cohort should still use the same gem version. Mixed-version cohorts run in
 separate namespaces and can duplicate test execution, but cannot mutate each
 other's coordinator state.
 
+**Recovering a lost batch-commit response**
+
+Each batch saves its exact request and response in a generation-scoped receipt,
+atomically with the result counters and acknowledgments. A connection error or
+read timeout triggers at most two recovery attempts (after 100ms and 200ms).
+These recoveries return the original receipt; they cannot apply the batch again.
+This preserves assertions, outcome lists, requeues, and local commit statuses
+when Redis applied the batch but its reply was lost, including after stream
+cleanup. Other mutating coordinator operations still disable transparent replay.
+
+Receipts expire after the run's retention TTL from the commit and add storage
+proportional to the result payloads. Recovery validates the attempt generation,
+authoritative statistics, and exact payload. A missing receipt fails closed:
+Redis may never have executed the write, or the receipt may have expired or been
+lost. The worker reports a coordinator failure rather than guessing or counting
+the batch twice. This recovers lost replies, not an unavailable Redis service;
+it does not re-execute tests or change selective test retries.
+
 **Limitations**
 
 **Parallel tests not supported:** Minitest comes bundled with a parallel test
